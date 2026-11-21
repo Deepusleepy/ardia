@@ -74,39 +74,48 @@ test("every command panel frame is a PanelBox and CommandPanel animates nothing"
   assert.deepEqual(animated, [], "CommandPanel.tsx uses no Animated value");
 });
 
-test("an open whose panel changes width or loses height while it settles is counted once, a steady one never", () => {
+test("an open whose panel changes width while it settles is counted once; rows coming and going never are", () => {
   setConsentPeriod(true, "command-panel-on");
   takeInlineCompletionCounts();
   let now = 0;
   const steady = openRelayoutWatch(() => now);
   steady({ width: 361, height: 230 });
   now = 25;
+  steady({ width: 361, height: 70 });
   steady({ width: 361, height: 230 });
-  assert.equal(takeInlineCompletionCounts().command_bar_open_relayouts, 0);
+  assert.equal(takeInlineCompletionCounts().command_bar_open_relayouts, 0, "typing right after opening changes only the height");
 
   now = 0;
   const regrown = openRelayoutWatch(() => now);
   regrown({ width: 224, height: 230 });
   now = 25;
-  regrown({ width: 224, height: 34 });
   regrown({ width: 361, height: 230 });
+  regrown({ width: 300, height: 230 });
   assert.equal(takeInlineCompletionCounts().command_bar_open_relayouts, 1);
 
   now = 0;
-  const typedLater = openRelayoutWatch(() => now);
-  typedLater({ width: 361, height: 230 });
+  const resizedLater = openRelayoutWatch(() => now);
+  resizedLater({ width: 361, height: 230 });
   now = OPEN_SETTLE_MS + 1;
-  typedLater({ width: 361, height: 70 });
+  resizedLater({ width: 300, height: 230 });
   assert.equal(takeInlineCompletionCounts().command_bar_open_relayouts, 0);
 });
 
-test("a relayout is not counted while sharing is off", () => {
+test("an open that began while sharing was off is never counted, even if sharing comes on before it settles", () => {
   takeInlineCompletionCounts();
   setConsentPeriod(false, "command-panel-off");
   let now = 0;
   const watch = openRelayoutWatch(() => now);
   watch({ width: 224, height: 230 });
+  setConsentPeriod(true, "command-panel-on");
   watch({ width: 361, height: 230 });
   assert.equal(takeInlineCompletionCounts().command_bar_open_relayouts, 0);
-  setConsentPeriod(true, "command-panel-on");
+});
+
+test("the panel's rows keep the same parent with or without a clip, so a placement change never remounts the bar", () => {
+  const clipped = firstFrame({ clipRadius: 12 });
+  const plain = firstFrame({});
+  const holder = (node) => [node.props.children].flat().find((child) => deepestRowsPath(child));
+  assert.equal(holder(clipped).type, holder(plain).type);
+  assert.equal(deepestRowsPath(clipped).length, deepestRowsPath(plain).length);
 });

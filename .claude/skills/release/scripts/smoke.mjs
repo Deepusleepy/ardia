@@ -183,7 +183,10 @@ if (passkeys) {
   const name = "passkey dialog shows, offering iCloud Keychain (Passwords) next to Ardia's passkeys";
   const why = offers ? "both choices offered" : texts ? `choices missing from ${JSON.stringify(texts.filter((t) => /save|passkey/i.test(t)))}` : `its choices couldn't be read: ${unread}`;
   if (unread === "untrusted") needs(false, "this process isn't trusted for Accessibility: give the terminal Accessibility in System Settings › Privacy & Security")(name, false, `${detail}; choices unread`);
-  else checkTitles(name, !!dialog && offers, `${detail}; ${why}`);
+  else if (locked && !offers) {
+    checkTitles("passkey dialog shows", !!dialog, detail);
+    checkUnlocked(name, offers, `${detail}; ${why}; Accessibility reads no window contents while the screen is locked`);
+  } else checkTitles(name, !!dialog && offers, `${detail}; ${why}`);
 } else {
   checkTitles("passkey dialog shows (no browser passkey entitlement: Chrome's own dialog)", !!dialog && /passkey/i.test(dialog.title), dialog?.title || "no passkey window");
 }

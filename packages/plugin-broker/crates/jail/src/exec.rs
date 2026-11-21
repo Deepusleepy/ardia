@@ -8,6 +8,7 @@ use crate::{landlock, roots, seccomp, sys, Level, RunKind};
 
 pub const EXIT_SANDBOX_SETUP: i32 = 76;
 pub const EXIT_EXEC_FAILED: i32 = 127;
+pub const EXIT_PROBE_WITHOUT_OVERLAY: i32 = 77;
 pub const READY_FD: RawFd = 5;
 
 #[derive(Debug)]
@@ -61,15 +62,29 @@ fn parse_fd(args: &[String], name: &str) -> Option<RawFd> {
 
 pub fn exec_main(args: &[String]) -> ExecOutcome {
     if args.first().map(String::as_str) == Some("--probe") {
-        return match make_mounts_private_and_drop_capabilities() {
+        if let Err(error) = make_mounts_private() {
+            let _ = sys::write_all(
+                2,
+                format!("[ardia] the launcher can't make its mounts private: {error}\n").as_bytes(),
+            );
+            return ExecOutcome::Exit(EXIT_SANDBOX_SETUP);
+        }
+        let overlay = probe_overlay();
+        if let Err(error) = drop_capabilities() {
+            let _ = sys::write_all(
+                2,
+                format!("[ardia] the launcher can't drop its capabilities: {error}\n").as_bytes(),
+            );
+            return ExecOutcome::Exit(EXIT_SANDBOX_SETUP);
+        }
+        return match overlay {
             Ok(()) => ExecOutcome::Exit(0),
             Err(error) => {
                 let _ = sys::write_all(
                     2,
-                    format!("[ardia] the launcher can't make its mounts private: {error}\n")
-                        .as_bytes(),
+                    format!("overlayfs isn't usable here: {error}\n").as_bytes(),
                 );
-                ExecOutcome::Exit(EXIT_SANDBOX_SETUP)
+                ExecOutcome::Exit(EXIT_PROBE_WITHOUT_OVERLAY)
             }
         };
     }
@@ -205,11 +220,6 @@ fn mount_root<'a>(
     Ok(entry)
 }
 
-fn make_mounts_private_and_drop_capabilities() -> io::Result<()> {
-    make_mounts_private()?;
-    drop_capabilities()
-}
-
 fn make_mounts_private() -> io::Result<()> {
     sys::check(unsafe { libc::unshare(libc::CLONE_NEWNS) })?;
     let root = c"/";
@@ -248,20 +258,37 @@ fn mount_call(
 
 pub const SCRIPT_COPY_LIMIT: u64 = 16 << 20;
 
+fn same_file_state(a: &libc::stat, b: &libc::stat) -> bool {
+    (
+        a.st_dev,
+        a.st_ino,
+        a.st_size,
+        a.st_mtime,
+        a.st_mtime_nsec,
+        a.st_ctime,
+        a.st_ctime_nsec,
+    ) == (
+        b.st_dev,
+        b.st_ino,
+        b.st_size,
+        b.st_mtime,
+        b.st_mtime_nsec,
+        b.st_ctime,
+        b.st_ctime_nsec,
+    )
+}
+
 fn read_verified(fd: &OwnedFd, limit: u64) -> io::Result<(Vec<u8>, u32)> {
-    let info = sys::fstat(fd.as_raw_fd())?;
-    if info.st_size as u64 > limit {
-        return Err(sys::invalid("the script is over 16 MB"));
-    }
-    let mut bytes = vec![0u8; info.st_size as usize];
-    let mut done = 0;
-    while done < bytes.len() {
+    let before = sys::fstat(fd.as_raw_fd())?;
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0u8; 64 << 10];
+    loop {
         let count = unsafe {
             libc::pread(
                 fd.as_raw_fd(),
-                bytes[done..].as_mut_ptr().cast(),
-                bytes.len() - done,
-                done as libc::off_t,
+                chunk.as_mut_ptr().cast(),
+                chunk.len(),
+                bytes.len() as libc::off_t,
             )
         };
         if count < 0 {
@@ -272,11 +299,57 @@ fn read_verified(fd: &OwnedFd, limit: u64) -> io::Result<(Vec<u8>, u32)> {
             return Err(error);
         }
         if count == 0 {
-            return Err(sys::invalid("the script shrank while it was copied"));
+            break;
         }
-        done += count as usize;
+        bytes.extend_from_slice(&chunk[..count as usize]);
+        if bytes.len() as u64 > limit {
+            return Err(sys::invalid("the script is over 16 MB"));
+        }
     }
-    Ok((bytes, info.st_mode & 0o755))
+    let after = sys::fstat(fd.as_raw_fd())?;
+    if !same_file_state(&before, &after) || bytes.len() as i64 != after.st_size {
+        return Err(sys::invalid("the script changed while it was being pinned"));
+    }
+    Ok((bytes, after.st_mode))
+}
+
+fn copy_mode(source_mode: u32) -> u32 {
+    let owner_execute = if source_mode & 0o111 != 0 { 0o1 } else { 0 };
+    ((0o4 | owner_execute) << 6) | (source_mode & 0o055)
+}
+
+fn carried_mount_flags(folder: &roots::MountEntry) -> io::Result<libc::c_ulong> {
+    let has = |name: &[u8]| folder.options.iter().any(|option| option == name);
+    if has(b"noexec") {
+        return Err(sys::invalid(
+            "the script's folder is mounted noexec, so the script can't run",
+        ));
+    }
+    let mut flags = libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV;
+    if has(b"noatime") {
+        flags |= libc::MS_NOATIME;
+    }
+    if has(b"nodiratime") {
+        flags |= libc::MS_NODIRATIME;
+    }
+    if has(b"strictatime") {
+        flags |= libc::MS_STRICTATIME;
+    }
+    Ok(flags)
+}
+
+fn flags_hold(mount: &roots::MountEntry, flags: libc::c_ulong) -> bool {
+    let has = |name: &[u8]| mount.options.iter().any(|option| option == name);
+    let wanted: [(libc::c_ulong, &[u8]); 5] = [
+        (libc::MS_RDONLY, b"ro"),
+        (libc::MS_NOSUID, b"nosuid"),
+        (libc::MS_NODEV, b"nodev"),
+        (libc::MS_NOATIME, b"noatime"),
+        (libc::MS_NODIRATIME, b"nodiratime"),
+    ];
+    wanted
+        .iter()
+        .all(|(flag, name)| flags & flag == 0 || has(name))
 }
 
 fn pin_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<()> {
@@ -290,7 +363,10 @@ fn pin_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<()> {
     {
         return Err(sys::invalid("the script's path isn't plain"));
     }
-    let (bytes, mode) = read_verified(verified, SCRIPT_COPY_LIMIT)?;
+    let folder = mount_root(&roots::read_mountinfo()?, root)?.clone();
+    let overlay_flags = carried_mount_flags(&folder)?;
+    let (bytes, source_mode) = read_verified(verified, SCRIPT_COPY_LIMIT)?;
+    let mode = copy_mode(source_mode);
     let layer = Path::new(crate::EXEC_STAGE_IN_JAIL);
     let nosuid_nodev = libc::MS_NOSUID | libc::MS_NODEV;
     let size = std::ffi::CString::new(format!("size={},mode=0755", bytes.len() + (1 << 20)))
@@ -316,7 +392,7 @@ fn pin_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<()> {
         Some(Path::new("ardia-pinned")),
         root,
         Some(c"overlay"),
-        libc::MS_RDONLY | nosuid_nodev,
+        overlay_flags,
         Some(&options),
     )?;
     let again = sys::openat(
@@ -332,10 +408,45 @@ fn pin_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<()> {
     }
     let entries = roots::read_mountinfo()?;
     let mount = mount_root(&entries, root)?;
-    if sys::mount_id(again.as_raw_fd())? != mount.id || !mount.read_only() || mount.propagates() {
+    if sys::mount_id(again.as_raw_fd())? != mount.id
+        || mount.propagates()
+        || !flags_hold(mount, overlay_flags)
+    {
         return Err(sys::invalid(
-            "the pinned script isn't on its own read-only, private overlay",
+            "the pinned script isn't on its own private overlay with the folder's flags",
         ));
+    }
+    Ok(())
+}
+
+fn probe_overlay() -> io::Result<()> {
+    let layer = Path::new(crate::EXEC_STAGE_IN_JAIL);
+    mount_call(
+        None,
+        layer,
+        Some(c"tmpfs"),
+        libc::MS_NOSUID | libc::MS_NODEV,
+        Some(c"size=64k,mode=0755"),
+    )?;
+    for name in ["upper", "lower", "merged"] {
+        std::fs::create_dir(layer.join(name))?;
+    }
+    std::fs::write(layer.join("upper/probe"), b"overlay")?;
+    let options = std::ffi::CString::new(format!(
+        "lowerdir={}:{}",
+        layer.join("upper").display(),
+        layer.join("lower").display()
+    ))
+    .map_err(|_| sys::invalid("the overlay options hold a NUL byte"))?;
+    mount_call(
+        Some(Path::new("ardia-probe")),
+        &layer.join("merged"),
+        Some(c"overlay"),
+        libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+        Some(&options),
+    )?;
+    if std::fs::read(layer.join("merged/probe"))? != b"overlay" {
+        return Err(sys::invalid("the probe overlay didn't show its layer"));
     }
     Ok(())
 }
@@ -725,6 +836,62 @@ mod tests {
             paths(&["/run/ardia/plugin/nested", "/usr/local"])
         );
         assert!(unexpected_mounts(&paths(&["/usr", "/proc/sys"]), &trees, &expected).is_empty());
+    }
+
+    #[test]
+    fn the_copy_mode_gives_the_launcher_what_it_can_do_and_drops_set_id_bits() {
+        assert_eq!(copy_mode(0o100055), 0o555);
+        assert_eq!(copy_mode(0o104755), 0o555);
+        assert_eq!(copy_mode(0o100644), 0o444);
+        assert_eq!(copy_mode(0o100700), 0o500);
+    }
+
+    #[test]
+    fn folder_flags_carry_over_and_noexec_is_refused() {
+        let entry = |options: &[&str]| roots::MountEntry {
+            id: 1,
+            parent: 0,
+            point: "/run/ardia/program".into(),
+            options: options.iter().map(|o| o.as_bytes().to_vec()).collect(),
+            tags: Vec::new(),
+        };
+        assert!(carried_mount_flags(&entry(&["ro", "nosuid", "nodev", "noexec"])).is_err());
+        let flags = carried_mount_flags(&entry(&["ro", "nosuid", "nodev", "noatime"])).unwrap();
+        assert_ne!(flags & libc::MS_NOATIME, 0);
+        assert!(flags_hold(
+            &entry(&["ro", "nosuid", "nodev", "noatime"]),
+            flags
+        ));
+        assert!(!flags_hold(
+            &entry(&["ro", "nosuid", "nodev", "relatime"]),
+            flags
+        ));
+        assert!(!flags_hold(
+            &entry(&["rw", "nosuid", "nodev"]),
+            libc::MS_RDONLY
+        ));
+    }
+
+    #[test]
+    fn the_script_copy_reads_to_the_end_and_refuses_a_file_that_disagrees_with_itself() {
+        let status = std::fs::File::open("/proc/self/status").unwrap();
+        let status = OwnedFd::from(status);
+        assert!(
+            read_verified(&status, SCRIPT_COPY_LIMIT).is_err(),
+            "a file whose size disagrees with its contents must not be copied as a prefix"
+        );
+        let path = std::env::temp_dir().join(format!("jail-copy-{}", std::process::id()));
+        std::fs::write(&path, vec![b'x'; 3000]).unwrap();
+        let file = OwnedFd::from(std::fs::File::open(&path).unwrap());
+        assert_eq!(
+            read_verified(&file, SCRIPT_COPY_LIMIT).unwrap().0.len(),
+            3000
+        );
+        assert!(
+            read_verified(&file, 1000).is_err(),
+            "the cap must hold while reading"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

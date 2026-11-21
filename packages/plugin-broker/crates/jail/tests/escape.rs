@@ -355,6 +355,7 @@ impl Sim {
 struct Caps {
     abi: Option<u32>,
     full: bool,
+    folder_scripts: bool,
 }
 
 fn caps_from(lines: &[String]) -> Caps {
@@ -368,7 +369,12 @@ fn caps_from(lines: &[String]) -> Caps {
         .find_map(|w| w.strip_prefix("abi="))
         .and_then(|v| v.parse().ok());
     let full = line.contains("full=ok");
-    Caps { abi, full }
+    let folder_scripts = line.contains("folder_scripts=ok");
+    Caps {
+        abi,
+        full,
+        folder_scripts,
+    }
 }
 
 fn field(line: &str, name: &str) -> i32 {
@@ -1010,6 +1016,30 @@ fn full_sidecars_available(lines: &[String]) -> bool {
     caps.full && caps.abi.map(|abi| abi >= 2).unwrap_or(false)
 }
 
+fn no_overlay_expected() -> bool {
+    std::env::var("JAIL_EXPECT_NO_OVERLAY").as_deref() == Ok("1")
+}
+
+fn script_sidecars(test: &str, lines: &[String]) -> bool {
+    if !full_sidecars_available(lines) {
+        skip(test, "sidecars aren't available", "full");
+        return false;
+    }
+    if caps_from(lines).folder_scripts {
+        return true;
+    }
+    if no_overlay_expected() {
+        eprintln!("SUMMARY {test} not-applicable (no overlayfs, as JAIL_EXPECT_NO_OVERLAY says)");
+        return false;
+    }
+    skip(
+        test,
+        "overlayfs isn't usable, so scripts inside folders are off",
+        "full",
+    );
+    false
+}
+
 fn build_preload(world: &World) -> Option<PathBuf> {
     let source = world.root.join("preload.c");
     std::fs::write(
@@ -1159,8 +1189,7 @@ fn a_script_program_runs_from_its_pinned_fd() {
     args.push("probe=from-script".into());
     let before = stamp(&script);
     let lines = run_to_end(&world, args);
-    if !full_sidecars_available(&lines) {
-        skip("script", "sidecars aren't available", "full");
+    if !script_sidecars("script", &lines) {
         return;
     }
     assert_eq!(
@@ -1782,8 +1811,7 @@ fn a_script_sources_its_siblings_and_keeps_running_the_verified_copy_after_a_ren
     args.push(format!("program={}", script.display()));
     args.push("probe=siblings".into());
     let lines = run_to_end(&world, args);
-    if !full_sidecars_available(&lines) {
-        skip("script_siblings", "sidecars aren't available", "full");
+    if !script_sidecars("script_siblings", &lines) {
         return;
     }
     let after = lines
@@ -1852,8 +1880,7 @@ fn a_script_sees_real_siblings_through_unreadable_and_crowded_folders() {
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
     )
     .unwrap();
-    if !full_sidecars_available(&lines) {
-        skip("crowded_script", "sidecars aren't available", "full");
+    if !script_sidecars("crowded_script", &lines) {
         return;
     }
     let crowd = lines
@@ -1880,4 +1907,211 @@ fn a_script_sees_real_siblings_through_unreadable_and_crowded_folders() {
         !lines.iter().any(|l| l.contains("WROTE-PROGRAM")),
         "{lines:#?}"
     );
+}
+
+fn noexec_wrapper(target: &Path, source: &Path) -> Vec<String> {
+    let script = format!(
+        "mount -t tmpfs -o noexec,size=16m noexec '{}' && cp -a '{}/.' '{}/' && exec \"$@\"",
+        target.display(),
+        source.display(),
+        target.display()
+    );
+    [
+        "unshare",
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--propagation",
+        "private",
+        "sh",
+        "-c",
+        &script,
+        "sh",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+#[test]
+fn programs_in_a_noexec_folder_never_run() {
+    let world = World::new("noexec");
+    if !userns_wrapper_works() {
+        skip(
+            "noexec",
+            "the test can't make a user namespace to mount in",
+            "tool",
+        );
+        return;
+    }
+    let source = world.root.join("progs-src/pkg");
+    write(
+        &source.join("bin/run.sh"),
+        "#!/bin/sh\necho RAN >&3\necho DONE >&3\n",
+    );
+    write(&source.join("bin/helper.sh"), "#!/bin/sh\necho HELPER\n");
+    std::fs::copy(harness(), source.join("bin/tool")).unwrap();
+    for name in ["bin/run.sh", "bin/helper.sh", "bin/tool"] {
+        std::fs::set_permissions(
+            source.join(name),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let target = world.root.join("progs/noexec-pkg");
+    std::fs::create_dir_all(&target).unwrap();
+    let wrap = noexec_wrapper(&target, &source);
+    let wrap: Vec<&str> = wrap.iter().map(String::as_str).collect();
+    for program in ["bin/run.sh", "bin/tool"] {
+        let mut args: Vec<String> = world
+            .sim_args("sidecar", "probe")
+            .into_iter()
+            .filter(|a| !a.starts_with("program=") && !a.starts_with("static="))
+            .collect();
+        args.push(format!("program={}", target.join(program).display()));
+        args.push("probe=escape".into());
+        args.push("static=0".into());
+        let lines = Sim::start(&world, args, &wrap).finish(Duration::from_secs(30));
+        if !full_sidecars_available(&lines) {
+            skip(
+                "noexec",
+                "sidecars aren't available inside the test's namespace",
+                "full",
+            );
+            return;
+        }
+        let outcome = lines
+            .iter()
+            .find(|l| {
+                l.starts_with("REFUSED")
+                    || l.starts_with("SETUP-FAILED")
+                    || l.starts_with("SPAWNED")
+            })
+            .cloned()
+            .unwrap_or_default();
+        eprintln!("SUMMARY noexec/{program} {outcome}");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l == "LINE RAN" || l.starts_with("LINE RESULT")),
+            "{program} ran from a noexec folder: {lines:#?}"
+        );
+        assert!(
+            outcome.starts_with("REFUSED") && outcome.contains("noexec"),
+            "{program}: {lines:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_script_another_user_owns_with_unusual_mode_bits_still_runs() {
+    let world = World::new("foreign-mode");
+    let sudo = Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !sudo {
+        skip(
+            "foreign_mode",
+            "the test needs passwordless sudo to make a root-owned script",
+            "tool",
+        );
+        return;
+    }
+    let package = world.root.join("progs/foreign-pkg");
+    let script = package.join("bin/run.sh");
+    write(
+        &script,
+        "#!/bin/sh\necho \"FOREIGN self=$0\" >&3\necho DONE >&3\n",
+    );
+    let ok = Command::new("sudo")
+        .args(["-n", "sh", "-c"])
+        .arg(format!(
+            "chown -R 0:0 '{}' && chmod 0055 '{}'",
+            package.display(),
+            script.display()
+        ))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(ok, "couldn't prepare the root-owned script");
+    let mut args: Vec<String> = world
+        .sim_args("sidecar", "probe")
+        .into_iter()
+        .filter(|a| !a.starts_with("program="))
+        .collect();
+    args.push(format!("program={}", script.display()));
+    args.push("probe=foreign".into());
+    let lines = run_to_end(&world, args);
+    let _ = Command::new("sudo")
+        .args(["-n", "chown", "-R"])
+        .arg(format!("{}:{}", unsafe { libc::getuid() }, unsafe {
+            libc::getgid()
+        }))
+        .arg(&package)
+        .status();
+    if !script_sidecars("foreign_mode", &lines) {
+        return;
+    }
+    let ran = lines
+        .iter()
+        .find(|l| l.starts_with("LINE FOREIGN"))
+        .cloned()
+        .unwrap_or_default();
+    eprintln!("SUMMARY foreign_mode {ran}");
+    assert!(
+        ran.contains("self=/run/ardia/program/bin/run.sh"),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+fn scripts_inside_folders_are_refused_without_overlayfs_while_elf_sidecars_still_run() {
+    let world = World::new("no-overlay");
+    let script = world.root.join("progs/no-overlay-pkg/bin/run.sh");
+    write(&script, "#!/bin/sh\necho RAN >&3\necho DONE >&3\n");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut args: Vec<String> = world
+        .sim_args("sidecar", "probe")
+        .into_iter()
+        .filter(|a| !a.starts_with("program="))
+        .collect();
+    args.push(format!("program={}", script.display()));
+    let lines = run_to_end(&world, args);
+    if !full_sidecars_available(&lines) {
+        skip("no_overlay", "sidecars aren't available", "full");
+        return;
+    }
+    let caps = lines
+        .iter()
+        .find(|l| l.starts_with("CAPS"))
+        .cloned()
+        .unwrap_or_default();
+    if caps_from(&lines).folder_scripts {
+        assert!(
+            !no_overlay_expected(),
+            "JAIL_EXPECT_NO_OVERLAY=1 but overlayfs works: {caps}"
+        );
+        eprintln!("SUMMARY no_overlay not-applicable (overlayfs works here)");
+        return;
+    }
+    let refused = lines
+        .iter()
+        .find(|l| l.starts_with("REFUSED"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(refused.contains("overlayfs"), "{lines:#?}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l == "LINE RAN" || l.starts_with("SPAWNED")),
+        "{lines:#?}"
+    );
+    let elf = run_to_end(&world, world.sim_args("sidecar", "probe"));
+    let (_, escaped) = summarize("no_overlay_elf", &elf);
+    assert!(elf.iter().any(|l| l.starts_with("SPAWNED")), "{elf:#?}");
+    assert_eq!(escaped, 0, "{elf:#?}");
+    world.check_untouched();
+    eprintln!("SUMMARY no_overlay script-refused elf-ran {caps}");
 }

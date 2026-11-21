@@ -67,6 +67,7 @@ impl SupervisorConfig {
 pub struct Capabilities {
     pub landlock_abi: Result<u32, Unavailable>,
     pub full_isolation: Result<(), String>,
+    pub folder_scripts: Result<(), String>,
     pub launcher: Linkage,
     pub cgroup: Option<PathBuf>,
 }
@@ -231,6 +232,35 @@ impl Program {
             name,
             sys::RESOLVE_NO_SYMLINKS | sys::RESOLVE_NO_MAGICLINKS,
         )
+    }
+
+    fn needs_overlay(&self, placement: ProgramPlacement) -> bool {
+        let inside_a_folder = matches!(placement, ProgramPlacement::InsidePluginFolder)
+            || (matches!(placement, ProgramPlacement::Separate) && self.folder.is_some());
+        self.script && inside_a_folder
+    }
+
+    fn refuse_noexec(&self) -> Result<(), String> {
+        let noexec = |fd: RawFd| -> Result<bool, String> {
+            let mut info: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatvfs(fd, &mut info) } != 0 {
+                return Err(format!(
+                    "the program's filesystem can't be checked: {}",
+                    sys::last_error()
+                ));
+            }
+            Ok(info.f_flag & libc::ST_NOEXEC != 0)
+        };
+        let mut places = vec![self.file.as_raw_fd()];
+        places.extend(self.folder.as_ref().map(|folder| folder.as_raw_fd()));
+        for fd in places {
+            if noexec(fd)? {
+                return Err(
+                    "the program sits on a filesystem mounted noexec, so it can't run".into(),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn check_dir(&self) -> io::Result<OwnedFd> {
@@ -586,6 +616,7 @@ impl Supervisor {
             capabilities: Capabilities {
                 landlock_abi: landlock::kernel_abi(),
                 full_isolation: Err("not probed".into()),
+                folder_scripts: Err("not probed".into()),
                 launcher,
                 cgroup,
             },
@@ -596,7 +627,16 @@ impl Supervisor {
             spawner: Spawner::start()?,
             devnull,
         };
-        supervisor.capabilities.full_isolation = supervisor.probe_full_isolation();
+        match supervisor.probe_full_isolation() {
+            Ok(folder_scripts) => {
+                supervisor.capabilities.full_isolation = Ok(());
+                supervisor.capabilities.folder_scripts = folder_scripts;
+            }
+            Err(why) => {
+                supervisor.capabilities.folder_scripts = Err(why.clone());
+                supervisor.capabilities.full_isolation = Err(why);
+            }
+        }
         Ok(supervisor)
     }
 
@@ -680,7 +720,7 @@ impl Supervisor {
         ])
     }
 
-    fn probe_full_isolation(&mut self) -> Result<(), String> {
+    fn probe_full_isolation(&mut self) -> Result<Result<(), String>, String> {
         let bwrap = self.bwrap.as_ref().ok_or("no bundled bwrap")?.as_raw_fd();
         let (code, help) = self.run_once(bwrap, strings(&["ardia-bwrap", "--help"]), Vec::new())?;
         for flag in [
@@ -719,16 +759,25 @@ impl Supervisor {
             },
             rights: 0,
         });
+        entries.push(plan::Entry {
+            dest: crate::EXEC_STAGE_IN_JAIL.into(),
+            source: plan::Source::Dir,
+            rights: 0,
+        });
         argv.extend(plan::Plan { entries }.bwrap_mounts());
         argv.extend(strings(&["--", BROKER_PATH_IN_JAIL, "exec", "--probe"]));
         let (code, output) = self.run_once(bwrap, argv, vec![(self.broker_exe.as_raw_fd(), 3)])?;
-        if code != 0 {
-            return Err(format!(
+        match code {
+            0 => Ok(Ok(())),
+            crate::exec::EXIT_PROBE_WITHOUT_OVERLAY => Ok(Err(format!(
+                "scripts inside a folder need overlayfs to keep their path, and {}",
+                output.trim()
+            ))),
+            _ => Err(format!(
                 "bwrap couldn't make namespaces (exit {code}): {}",
                 output.trim()
-            ));
+            )),
         }
-        Ok(())
     }
 
     pub fn placement(&self, kind: RunKind) -> Result<(Level, u32), SpawnError> {
@@ -820,6 +869,14 @@ impl Supervisor {
             program
                 .verify_destination(placement, request.plugin_dir.as_raw_fd())
                 .map_err(SpawnError::Refused)?;
+            program.refuse_noexec().map_err(SpawnError::Refused)?;
+            if program.needs_overlay(placement) {
+                if let Err(why) = &self.capabilities.folder_scripts {
+                    return Err(SpawnError::Refused(format!(
+                        "this script can't run here: {why}"
+                    )));
+                }
+            }
         }
         if let Work::Sidecar { program, .. } = &request.work {
             roots::refuse_nested_mounts("the plugin's data", request.data_dir.as_raw_fd())
@@ -895,10 +952,7 @@ impl Supervisor {
                 frame.env = Self::sidecar_environment(request)?;
                 let jail_path = program.jail_path(placement, &plugin_path)?;
                 let (device, inode) = sys::identity(program.file.as_raw_fd())?;
-                let inside_a_folder = matches!(placement, ProgramPlacement::InsidePluginFolder)
-                    || (matches!(placement, ProgramPlacement::Separate)
-                        && program.folder.is_some());
-                let pin_with_overlay = program.script && inside_a_folder;
+                let pin_with_overlay = program.needs_overlay(placement);
                 frame.program = Some(PinnedProgram {
                     path: jail_path.clone(),
                     device,
@@ -1317,14 +1371,7 @@ impl Supervisor {
                     straggler._pidfd = None;
                 }
             }
-            if straggler
-                .cgroup
-                .as_ref()
-                .map(|c| c.try_remove())
-                .unwrap_or(false)
-            {
-                straggler.cgroup = None;
-            }
+            settle_cgroup(&mut straggler.cgroup);
             straggler.pid.is_some() || straggler.cgroup.is_some()
         });
     }
@@ -1422,6 +1469,20 @@ impl Supervisor {
     }
 }
 
+fn settle_cgroup(cgroup: &mut Option<RunCgroup>) {
+    let Some(current) = cgroup.as_ref() else {
+        return;
+    };
+    match current.try_remove() {
+        crate::cgroup::Removal::Removed => *cgroup = None,
+        crate::cgroup::Removal::Busy => {}
+        crate::cgroup::Removal::GaveUp(error) => {
+            current.give_up(&error);
+            *cgroup = None;
+        }
+    }
+}
+
 fn reap_independently(stragglers: &mut Vec<Straggler>, deadline: Option<Instant>) {
     loop {
         stragglers.retain_mut(|straggler| {
@@ -1431,14 +1492,7 @@ fn reap_independently(stragglers: &mut Vec<Straggler>, deadline: Option<Instant>
                     straggler._pidfd = None;
                 }
             }
-            if straggler
-                .cgroup
-                .as_ref()
-                .map(|c| c.try_remove())
-                .unwrap_or(false)
-            {
-                straggler.cgroup = None;
-            }
+            settle_cgroup(&mut straggler.cgroup);
             straggler.pid.is_some() || straggler.cgroup.is_some()
         });
         if stragglers.is_empty() || deadline.is_some_and(|deadline| Instant::now() >= deadline) {

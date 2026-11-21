@@ -171,6 +171,13 @@ impl CgroupDelegate {
 }
 
 #[derive(Debug)]
+pub enum Removal {
+    Removed,
+    Busy,
+    GaveUp(io::Error),
+}
+
+#[derive(Debug)]
 pub struct RunCgroup {
     parent: OwnedFd,
     dir: OwnedFd,
@@ -229,28 +236,87 @@ impl RunCgroup {
         &self.name
     }
 
-    pub fn try_remove(&self) -> bool {
+    pub fn try_remove(&self) -> Removal {
         if self.populated() {
             let _ = self.kill();
-            return false;
+            return Removal::Busy;
         }
-        let Ok(name) = sys::cstring(Path::new(&self.name)) else {
-            return false;
+        let name = match sys::cstring(Path::new(&self.name)) {
+            Ok(name) => name,
+            Err(error) => return Removal::GaveUp(error),
         };
-        let removed =
-            unsafe { libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
-        removed == 0 || sys::last_error().raw_os_error() == Some(libc::ENOENT)
+        if unsafe { libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
+            == 0
+        {
+            return Removal::Removed;
+        }
+        let error = sys::last_error();
+        match error.raw_os_error() {
+            Some(libc::ENOENT) => Removal::Removed,
+            Some(libc::EBUSY) | Some(libc::ENOTEMPTY) | Some(libc::EAGAIN) | Some(libc::EINTR) => {
+                Removal::Busy
+            }
+            _ => Removal::GaveUp(error),
+        }
+    }
+
+    pub fn give_up(&self, error: &io::Error) {
+        let _ = sys::write_all(
+            2,
+            format!(
+                "[ardia] the run's cgroup {} can't be removed ({error}), so it's left behind\n",
+                self.name
+            )
+            .as_bytes(),
+        );
     }
 
     pub fn empty_and_remove(self, deadline: Instant) -> Result<(), RunCgroup> {
         loop {
-            if self.try_remove() {
-                return Ok(());
+            match self.try_remove() {
+                Removal::Removed => return Ok(()),
+                Removal::GaveUp(error) => {
+                    self.give_up(&error);
+                    return Ok(());
+                }
+                Removal::Busy => {}
             }
             if Instant::now() >= deadline {
                 return Err(self);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_permanent_removal_error_gives_up_instead_of_waiting() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("jail-cgroup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("run-x")).unwrap();
+        let open_dir = |path: &Path| {
+            sys::openat(libc::AT_FDCWD, path, libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap()
+        };
+        let run = RunCgroup {
+            parent: open_dir(&base),
+            dir: open_dir(&base.join("run-x")),
+            procs: open_dir(&base.join("run-x")),
+            name: "run-x".into(),
+        };
+        std::fs::set_permissions(&base, std::os::unix::fs::PermissionsExt::from_mode(0o555))
+            .unwrap();
+        let outcome = run.try_remove();
+        std::fs::set_permissions(&base, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert!(matches!(outcome, Removal::GaveUp(_)), "{outcome:?}");
+        assert!(matches!(run.try_remove(), Removal::Removed));
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

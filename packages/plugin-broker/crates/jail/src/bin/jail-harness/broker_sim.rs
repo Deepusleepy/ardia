@@ -205,12 +205,16 @@ pub fn main(args: &[String]) -> i32 {
     };
     let caps = supervisor.capabilities().clone();
     say(&format!(
-        "CAPS launcher={:?} abi={} full={}",
+        "CAPS launcher={:?} abi={} full={} folder_scripts={}",
         caps.launcher,
         caps.landlock_abi
             .map(|abi| abi.to_string())
             .unwrap_or_else(|why| format!("none:{why}")),
         caps.full_isolation
+            .as_ref()
+            .map(|_| "ok".to_string())
+            .unwrap_or_else(|why| format!("no:{why}")),
+        caps.folder_scripts
             .as_ref()
             .map(|_| "ok".to_string())
             .unwrap_or_else(|why| format!("no:{why}"))

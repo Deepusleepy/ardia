@@ -2,11 +2,13 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::sys;
 
 pub const RUN_PIDS_MAX: u64 = 512;
+pub const UNSURE_REMOVAL_GRACE: Duration = Duration::from_secs(30);
 
 fn random_u64() -> io::Result<u64> {
     let mut bytes = [0u8; 8];
@@ -166,6 +168,7 @@ impl CgroupDelegate {
             dir,
             procs,
             name: name.to_string(),
+            unsure_since: Mutex::new(None),
         })
     }
 }
@@ -183,6 +186,7 @@ pub struct RunCgroup {
     dir: OwnedFd,
     procs: OwnedFd,
     name: String,
+    unsure_since: Mutex<Option<Instant>>,
 }
 
 impl RunCgroup {
@@ -259,9 +263,16 @@ impl RunCgroup {
             Some(libc::EBUSY) | Some(libc::ENOTEMPTY) | Some(libc::EAGAIN) | Some(libc::EINTR) => {
                 Removal::Busy
             }
-            _ if populated.is_none() => Removal::Busy,
+            _ if populated.is_none() && !self.unsure_for_too_long() => Removal::Busy,
             _ => Removal::GaveUp(error),
         }
+    }
+
+    fn unsure_for_too_long(&self) -> bool {
+        let Ok(mut since) = self.unsure_since.lock() else {
+            return true;
+        };
+        since.get_or_insert_with(Instant::now).elapsed() >= UNSURE_REMOVAL_GRACE
     }
 
     pub fn give_up(&self, error: &io::Error) {
@@ -298,7 +309,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_known_empty_cgroup_with_a_permanent_error_is_given_up() {
+    fn a_permanent_removal_error_is_given_up_once_empty_or_unsure_for_too_long() {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
@@ -313,6 +324,7 @@ mod tests {
             dir: open_dir(&base.join("run-x")),
             procs: open_dir(&base.join("run-x")),
             name: "run-x".into(),
+            unsure_since: Mutex::new(None),
         };
         let events = base.join("run-x/cgroup.events");
         std::fs::write(&events, "populated 0\nfrozen 0\n").unwrap();
@@ -321,10 +333,18 @@ mod tests {
         let known_empty = run.try_remove();
         std::fs::remove_file(&events).unwrap();
         let unknown = run.try_remove();
+        let unknown_again = run.try_remove();
+        *run.unsure_since.lock().unwrap() = Some(Instant::now() - UNSURE_REMOVAL_GRACE);
+        let unknown_for_too_long = run.try_remove();
         std::fs::set_permissions(&base, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         assert!(matches!(known_empty, Removal::GaveUp(_)), "{known_empty:?}");
         assert!(matches!(unknown, Removal::Busy), "{unknown:?}");
+        assert!(matches!(unknown_again, Removal::Busy), "{unknown_again:?}");
+        assert!(
+            matches!(unknown_for_too_long, Removal::GaveUp(_)),
+            "{unknown_for_too_long:?}"
+        );
         assert!(matches!(run.try_remove(), Removal::Removed));
         std::fs::remove_dir_all(base).unwrap();
     }

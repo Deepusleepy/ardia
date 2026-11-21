@@ -529,7 +529,7 @@ fn probe_overlay() -> Result<(), OverlayProbe> {
     })?;
     match std::fs::read(layer.join("merged/probe")) {
         Ok(bytes) if bytes == b"overlay" => Ok(()),
-        Ok(_) => Err(OverlayProbe::Unsupported(sys::invalid(
+        Ok(_) => Err(OverlayProbe::Unsure(sys::invalid(
             "the probe overlay didn't show its layer",
         ))),
         Err(error) => Err(OverlayProbe::Unsure(error)),

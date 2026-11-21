@@ -297,6 +297,7 @@ export function syncLiveHomes() {
 }
 
 const ended = (state: CompletionState | undefined) => state === "merged" || state === "closed";
+const completedIn = new Map<string, ConsentToken | null>();
 
 function markCompletedTabs(folderId: string, gone: Record<string, CompletionState>, listed: Set<string>, consent: ConsentToken | null) {
   const s = useBrowser.getState();
@@ -304,8 +305,8 @@ function markCompletedTabs(folderId: string, gone: Record<string, CompletionStat
   for (const t of Object.values(s.tabs)) {
     const ref = t.liveItem;
     if (ref?.folderId !== folderId) continue;
-    if (ended(gone[ref.itemId]) && !hidden.has(ref.itemId) && !ref.completed) s.updateTab(t.id, { liveItem: { ...ref, completed: true } });
-    else if (ref.completed && listed.has(ref.itemId)) s.updateTab(t.id, { liveItem: { folderId, itemId: ref.itemId } });
+    if (ended(gone[ref.itemId]) && !hidden.has(ref.itemId) && !ref.completed) completedIn.set(t.id, consent), s.updateTab(t.id, { liveItem: { ...ref, completed: true } });
+    else if (ref.completed && listed.has(ref.itemId)) completedIn.delete(t.id), s.updateTab(t.id, { liveItem: { folderId, itemId: ref.itemId } });
   }
   closeCompletedTabs(consent);
 }
@@ -317,14 +318,15 @@ const inUse = (s: BrowserState, id: string) => {
 
 function closeCompletedTabs(consent?: ConsentToken | null) {
   const s = useBrowser.getState();
+  for (const id of completedIn.keys()) if (!s.tabs[id]) completedIn.delete(id);
   const { folders, items } = live();
   const shown = shownTabIds(s);
   const tabs = Object.values(s.tabs)
     .filter(({ id, liveItem: ref }) => ref?.completed && folders[ref.folderId]?.showCompleted === false && !shown.has(id) && !inPinnedContainer(s, id) && !inUse(s, id) && !items[ref.folderId]?.some((it) => it.id === ref.itemId))
     .map((t) => t.id);
   if (!tabs.length) return;
+  for (const id of tabs) noteLiveCompletedTabsClosed(1, completedIn.has(id) ? completedIn.get(id) : consent), completedIn.delete(id);
   s.closeTabs(tabs);
-  noteLiveCompletedTabsClosed(tabs.length, consent);
 }
 
 let started = false;

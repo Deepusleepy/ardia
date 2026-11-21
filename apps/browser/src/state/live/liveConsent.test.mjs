@@ -11,7 +11,7 @@ await import("../../test-native/index.ts");
 globalThis.fetch = async () => ({ status: 503 });
 const client = await import("../telemetry/client.ts");
 const { useBrowser } = await import("../browser/store.ts");
-const { openLiveItem, refreshFolder, refreshFolderWhile, startLiveEngine } = await import("./engine.ts");
+const { COMPLETION_MS, openLiveItem, refreshFolder, refreshFolderWhile, startLiveEngine } = await import("./engine.ts");
 const { SOURCES } = await import("./sources.ts");
 const { createFolder, hideItems, live, removeFolder, updateFolder } = await import("./store.ts");
 const { takeWorkCounts } = await import("../telemetry/workCounts.ts");
@@ -108,6 +108,26 @@ test("a Live refresh started with sharing off doesn't count closing a merged pul
   takeLiveCompletedTabsClosed();
   release();
   await refreshing;
+  assert.equal(S().tabs[tab], undefined, "the merged pull request's tab still closes");
+  assert.equal(takeLiveCompletedTabsClosed(), 0);
+});
+
+test("a merged pull request's row animating out after a refresh started with sharing off doesn't count its tab's close after sharing turns on", async () => {
+  const { id, prs } = await folderWith(2);
+  updateFolder(id, { showCompleted: false });
+  const tab = openLiveItem(w, id, prs[0], { background: true });
+  merged.add(prs[0].id);
+  listed.set(id, [prs[1]]);
+  let finish = null;
+  globalThis.setTimeout = (callback, ms, ...args) => (ms === COMPLETION_MS ? ((finish = callback), 0) : unrefTimeout(callback, ms, ...args));
+  sharing(false);
+  await refreshFolder(id);
+  globalThis.setTimeout = unrefTimeout;
+  assert.ok(finish, "the merged row animates out");
+  assert.ok(S().tabs[tab], "the tab waits for the row to leave");
+  sharing(true);
+  takeLiveCompletedTabsClosed();
+  finish();
   assert.equal(S().tabs[tab], undefined, "the merged pull request's tab still closes");
   assert.equal(takeLiveCompletedTabsClosed(), 0);
 });

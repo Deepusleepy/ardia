@@ -35,7 +35,7 @@ export type PinchMotion = {
 
 export function pinchStep(motion: PinchMotion, phase: PinchPhase, magnification: number) {
   if (motion.idle()) return;
-  if (phase === "began" && !motion.reduce) motion.begin();
+  if (phase === "began") motion.begin();
   if (phase === "ended" || phase === "cancelled") {
     const outcome = phase === "ended" ? pinchOutcome(magnification) : "stay";
     if (outcome === "close") return motion.close();

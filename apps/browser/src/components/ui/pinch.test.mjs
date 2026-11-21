@@ -63,10 +63,10 @@ test("a gesture follows live, then commits past a threshold or settles back", ()
   assert.deepEqual(cancelled.calls.at(-1), "settle");
 });
 
-test("with Reduce Motion nothing follows the fingers and only the thresholds act", () => {
+test("with Reduce Motion nothing follows the fingers and only the thresholds act, but each gesture still begins so it can take its consent token", () => {
   const still = recorder({ reduce: true });
   still.run([["began", 0], ["changed", -0.1], ["ended", -0.1], ["began", 0], ["ended", -0.3]]);
-  assert.deepEqual(still.calls, ["close"]);
+  assert.deepEqual(still.calls, ["begin", "begin", "close"]);
   const gone = recorder({ idle: true });
   gone.run([["began", 0], ["ended", 0.5]]);
   assert.deepEqual(gone.calls, []);

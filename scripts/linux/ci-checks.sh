@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
     --jobs) jobs=$2; shift 2 ;;
     --logs) logs=$2; shift 2 ;;
     --part) part=$2; shift 2 ;;
-    --shard) shard=${2%/*}; shards=${2#*/}; shift 2 ;;
+    --shard) case "$2" in */*) shard=${2%/*}; shards=${2#*/} ;; *) echo "$usage" >&2; exit 64 ;; esac; shift 2 ;;
     *) echo "$usage" >&2; exit 64 ;;
   esac
 done

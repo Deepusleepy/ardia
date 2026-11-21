@@ -9,6 +9,7 @@ use crate::{landlock, roots, seccomp, sys, Level, RunKind};
 pub const EXIT_SANDBOX_SETUP: i32 = 76;
 pub const EXIT_EXEC_FAILED: i32 = 127;
 pub const EXIT_PROBE_WITHOUT_OVERLAY: i32 = 77;
+pub const EXIT_PROBE_OVERLAY_UNSURE: i32 = 78;
 pub const READY_FD: RawFd = 5;
 
 #[derive(Debug)]
@@ -79,12 +80,19 @@ pub fn exec_main(args: &[String]) -> ExecOutcome {
         }
         return match overlay {
             Ok(()) => ExecOutcome::Exit(0),
-            Err(error) => {
+            Err(OverlayProbe::Unsupported(error)) => {
                 let _ = sys::write_all(
                     2,
                     format!("overlayfs isn't usable here: {error}\n").as_bytes(),
                 );
                 ExecOutcome::Exit(EXIT_PROBE_WITHOUT_OVERLAY)
+            }
+            Err(OverlayProbe::Unsure(error)) => {
+                let _ = sys::write_all(
+                    2,
+                    format!("overlayfs couldn't be checked just now: {error}\n").as_bytes(),
+                );
+                ExecOutcome::Exit(EXIT_PROBE_OVERLAY_UNSURE)
             }
         };
     }
@@ -283,11 +291,14 @@ fn read_verified(fd: &OwnedFd, limit: u64) -> io::Result<(Vec<u8>, u32)> {
     let mut bytes = Vec::new();
     let mut chunk = vec![0u8; 64 << 10];
     loop {
+        let room = (limit + 1)
+            .saturating_sub(bytes.len() as u64)
+            .min(chunk.len() as u64) as usize;
         let count = unsafe {
             libc::pread(
                 fd.as_raw_fd(),
                 chunk.as_mut_ptr().cast(),
-                chunk.len(),
+                room,
                 bytes.len() as libc::off_t,
             )
         };
@@ -301,10 +312,10 @@ fn read_verified(fd: &OwnedFd, limit: u64) -> io::Result<(Vec<u8>, u32)> {
         if count == 0 {
             break;
         }
-        bytes.extend_from_slice(&chunk[..count as usize]);
-        if bytes.len() as u64 > limit {
+        if bytes.len() as u64 + count as u64 > limit {
             return Err(sys::invalid("the script is over 16 MB"));
         }
+        bytes.extend_from_slice(&chunk[..count as usize]);
     }
     let after = sys::fstat(fd.as_raw_fd())?;
     if !same_file_state(&before, &after) || bytes.len() as i64 != after.st_size {
@@ -318,24 +329,61 @@ fn copy_mode(source_mode: u32) -> u32 {
     ((0o4 | owner_execute) << 6) | (source_mode & 0o055)
 }
 
-fn carried_mount_flags(folder: &roots::MountEntry) -> io::Result<libc::c_ulong> {
-    let has = |name: &[u8]| folder.options.iter().any(|option| option == name);
-    if has(b"noexec") {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Atime {
+    Strict,
+    Relative,
+    Never,
+}
+
+impl Atime {
+    fn of_mount(mount: &roots::MountEntry) -> Atime {
+        let has = |name: &[u8]| mount.options.iter().any(|option| option == name);
+        if has(b"noatime") {
+            Atime::Never
+        } else if has(b"relatime") {
+            Atime::Relative
+        } else {
+            Atime::Strict
+        }
+    }
+
+    fn of_flags(flags: libc::c_ulong) -> Atime {
+        if flags & libc::MS_NOATIME != 0 {
+            Atime::Never
+        } else if flags & libc::MS_RELATIME != 0 {
+            Atime::Relative
+        } else {
+            Atime::Strict
+        }
+    }
+
+    fn flag(self) -> libc::c_ulong {
+        match self {
+            Atime::Strict => libc::MS_STRICTATIME,
+            Atime::Relative => libc::MS_RELATIME,
+            Atime::Never => libc::MS_NOATIME,
+        }
+    }
+}
+
+fn overlay_flags(bind: &roots::MountEntry, granted: u64) -> io::Result<libc::c_ulong> {
+    let has = |name: &[u8]| bind.options.iter().any(|option| option == name);
+    let granted = granted as libc::c_ulong;
+    if has(b"noexec") || granted & libc::MS_NOEXEC != 0 {
         return Err(sys::invalid(
             "the script's folder is mounted noexec, so the script can't run",
         ));
     }
     let mut flags = libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV;
-    if has(b"noatime") {
-        flags |= libc::MS_NOATIME;
-    }
-    if has(b"nodiratime") {
+    if has(b"nodiratime") || granted & libc::MS_NODIRATIME != 0 {
         flags |= libc::MS_NODIRATIME;
     }
-    if has(b"strictatime") {
-        flags |= libc::MS_STRICTATIME;
+    if has(b"nosymfollow") || granted & sys::MS_NOSYMFOLLOW != 0 {
+        flags |= sys::MS_NOSYMFOLLOW;
     }
-    Ok(flags)
+    let atime = Atime::of_mount(bind).max(Atime::of_flags(granted));
+    Ok(flags | atime.flag())
 }
 
 fn flags_hold(mount: &roots::MountEntry, flags: libc::c_ulong) -> bool {
@@ -344,12 +392,14 @@ fn flags_hold(mount: &roots::MountEntry, flags: libc::c_ulong) -> bool {
         (libc::MS_RDONLY, b"ro"),
         (libc::MS_NOSUID, b"nosuid"),
         (libc::MS_NODEV, b"nodev"),
-        (libc::MS_NOATIME, b"noatime"),
         (libc::MS_NODIRATIME, b"nodiratime"),
+        (sys::MS_NOSYMFOLLOW, b"nosymfollow"),
     ];
     wanted
         .iter()
         .all(|(flag, name)| flags & flag == 0 || has(name))
+        && !has(b"noexec")
+        && Atime::of_mount(mount) == Atime::of_flags(flags)
 }
 
 fn pin_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<()> {
@@ -364,7 +414,7 @@ fn pin_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<()> {
         return Err(sys::invalid("the script's path isn't plain"));
     }
     let folder = mount_root(&roots::read_mountinfo()?, root)?.clone();
-    let overlay_flags = carried_mount_flags(&folder)?;
+    let overlay_flags = overlay_flags(&folder, program.folder_flags)?;
     let (bytes, source_mode) = read_verified(verified, SCRIPT_COPY_LIMIT)?;
     let mode = copy_mode(source_mode);
     let layer = Path::new(crate::EXEC_STAGE_IN_JAIL);
@@ -378,6 +428,9 @@ fn pin_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<()> {
     }
     std::fs::write(&copy, &bytes)?;
     std::fs::set_permissions(&copy, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+    if read_verified(verified, SCRIPT_COPY_LIMIT)?.0 != bytes {
+        return Err(sys::invalid("the script changed while it was being pinned"));
+    }
     mount_call(
         None,
         layer,
@@ -394,7 +447,13 @@ fn pin_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<()> {
         Some(c"overlay"),
         overlay_flags,
         Some(&options),
-    )?;
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("overlayfs couldn't lay the pinned script over its folder: {error}"),
+        )
+    })?;
     let again = sys::openat(
         libc::AT_FDCWD,
         &program.path,
@@ -419,36 +478,62 @@ fn pin_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-fn probe_overlay() -> io::Result<()> {
+#[derive(Debug)]
+enum OverlayProbe {
+    Unsupported(io::Error),
+    Unsure(io::Error),
+}
+
+fn overlay_refused_for_good(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENODEV) | Some(libc::EINVAL) | Some(libc::EPERM)
+    )
+}
+
+fn probe_overlay() -> Result<(), OverlayProbe> {
     let layer = Path::new(crate::EXEC_STAGE_IN_JAIL);
-    mount_call(
-        None,
-        layer,
-        Some(c"tmpfs"),
-        libc::MS_NOSUID | libc::MS_NODEV,
-        Some(c"size=64k,mode=0755"),
-    )?;
-    for name in ["upper", "lower", "merged"] {
-        std::fs::create_dir(layer.join(name))?;
-    }
-    std::fs::write(layer.join("upper/probe"), b"overlay")?;
-    let options = std::ffi::CString::new(format!(
-        "lowerdir={}:{}",
-        layer.join("upper").display(),
-        layer.join("lower").display()
-    ))
-    .map_err(|_| sys::invalid("the overlay options hold a NUL byte"))?;
+    let stage = || -> io::Result<std::ffi::CString> {
+        mount_call(
+            None,
+            layer,
+            Some(c"tmpfs"),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            Some(c"size=64k,mode=0755"),
+        )?;
+        for name in ["upper", "lower", "merged"] {
+            std::fs::create_dir(layer.join(name))?;
+        }
+        std::fs::write(layer.join("upper/probe"), b"overlay")?;
+        std::ffi::CString::new(format!(
+            "lowerdir={}:{}",
+            layer.join("upper").display(),
+            layer.join("lower").display()
+        ))
+        .map_err(|_| sys::invalid("the overlay options hold a NUL byte"))
+    };
+    let options = stage().map_err(OverlayProbe::Unsure)?;
     mount_call(
         Some(Path::new("ardia-probe")),
         &layer.join("merged"),
         Some(c"overlay"),
         libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
         Some(&options),
-    )?;
-    if std::fs::read(layer.join("merged/probe"))? != b"overlay" {
-        return Err(sys::invalid("the probe overlay didn't show its layer"));
+    )
+    .map_err(|error| {
+        if overlay_refused_for_good(&error) {
+            OverlayProbe::Unsupported(error)
+        } else {
+            OverlayProbe::Unsure(error)
+        }
+    })?;
+    match std::fs::read(layer.join("merged/probe")) {
+        Ok(bytes) if bytes == b"overlay" => Ok(()),
+        Ok(_) => Err(OverlayProbe::Unsupported(sys::invalid(
+            "the probe overlay didn't show its layer",
+        ))),
+        Err(error) => Err(OverlayProbe::Unsure(error)),
     }
-    Ok(())
 }
 
 fn drop_capabilities() -> io::Result<()> {
@@ -847,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_flags_carry_over_and_noexec_is_refused() {
+    fn the_overlay_takes_the_stricter_of_the_bind_and_the_grant() {
         let entry = |options: &[&str]| roots::MountEntry {
             id: 1,
             parent: 0,
@@ -855,8 +940,64 @@ mod tests {
             options: options.iter().map(|o| o.as_bytes().to_vec()).collect(),
             tags: Vec::new(),
         };
-        assert!(carried_mount_flags(&entry(&["ro", "nosuid", "nodev", "noexec"])).is_err());
-        let flags = carried_mount_flags(&entry(&["ro", "nosuid", "nodev", "noatime"])).unwrap();
+        let bare = entry(&["ro", "nosuid", "nodev"]);
+        let flags = overlay_flags(&bare, sys::MS_NOSYMFOLLOW).unwrap();
+        assert_ne!(flags & sys::MS_NOSYMFOLLOW, 0);
+        assert_ne!(flags & libc::MS_STRICTATIME, 0);
+        assert!(!flags_hold(&entry(&["ro", "nosuid", "nodev"]), flags));
+        assert!(flags_hold(
+            &entry(&["ro", "nosuid", "nodev", "nosymfollow"]),
+            flags
+        ));
+        assert!(!flags_hold(
+            &entry(&["ro", "nosuid", "nodev", "relatime", "nosymfollow"]),
+            flags
+        ));
+        assert!(overlay_flags(&bare, libc::MS_NOEXEC).is_err());
+        let relative = overlay_flags(&entry(&["ro", "nosuid", "nodev", "relatime"]), 0).unwrap();
+        assert_ne!(relative & libc::MS_RELATIME, 0);
+        let never = overlay_flags(
+            &entry(&["ro", "nosuid", "nodev", "relatime"]),
+            libc::MS_NOATIME,
+        )
+        .unwrap();
+        assert_eq!(never & (libc::MS_RELATIME | libc::MS_STRICTATIME), 0);
+        assert!(flags_hold(
+            &entry(&["ro", "nosuid", "nodev", "noatime"]),
+            never
+        ));
+        assert!(!flags_hold(
+            &entry(&["ro", "nosuid", "nodev", "relatime"]),
+            never
+        ));
+    }
+
+    #[test]
+    fn only_a_refusing_overlay_mount_counts_as_unsupported() {
+        for errno in [libc::ENODEV, libc::EINVAL, libc::EPERM] {
+            assert!(overlay_refused_for_good(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        for errno in [libc::ENOMEM, libc::ENOSPC, libc::EINTR, libc::EAGAIN] {
+            assert!(!overlay_refused_for_good(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+    }
+
+    #[test]
+    fn folder_flags_carry_over_and_noexec_is_refused() {
+        let from_bind = |bind: &roots::MountEntry| overlay_flags(bind, 0);
+        let entry = |options: &[&str]| roots::MountEntry {
+            id: 1,
+            parent: 0,
+            point: "/run/ardia/program".into(),
+            options: options.iter().map(|o| o.as_bytes().to_vec()).collect(),
+            tags: Vec::new(),
+        };
+        assert!(from_bind(&entry(&["ro", "nosuid", "nodev", "noexec"])).is_err());
+        let flags = from_bind(&entry(&["ro", "nosuid", "nodev", "noatime"])).unwrap();
         assert_ne!(flags & libc::MS_NOATIME, 0);
         assert!(flags_hold(
             &entry(&["ro", "nosuid", "nodev", "noatime"]),

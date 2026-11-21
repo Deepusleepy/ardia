@@ -208,10 +208,10 @@ impl RunCgroup {
         writable(self.dir.as_raw_fd(), "cgroup.kill")
     }
 
-    pub fn populated(&self) -> bool {
+    pub fn populated(&self) -> Option<bool> {
         read_at(self.dir.as_raw_fd(), "cgroup.events")
+            .ok()
             .map(|events| events.lines().any(|line| line.trim() == "populated 1"))
-            .unwrap_or(false)
     }
 
     pub fn members(&self) -> Vec<i32> {
@@ -237,8 +237,11 @@ impl RunCgroup {
     }
 
     pub fn try_remove(&self) -> Removal {
-        if self.populated() {
+        let populated = self.populated();
+        if populated != Some(false) {
             let _ = self.kill();
+        }
+        if populated == Some(true) {
             return Removal::Busy;
         }
         let name = match sys::cstring(Path::new(&self.name)) {
@@ -256,6 +259,7 @@ impl RunCgroup {
             Some(libc::EBUSY) | Some(libc::ENOTEMPTY) | Some(libc::EAGAIN) | Some(libc::EINTR) => {
                 Removal::Busy
             }
+            _ if populated.is_none() => Removal::Busy,
             _ => Removal::GaveUp(error),
         }
     }
@@ -294,7 +298,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_permanent_removal_error_gives_up_instead_of_waiting() {
+    fn only_a_known_empty_cgroup_with_a_permanent_error_is_given_up() {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
@@ -310,12 +314,17 @@ mod tests {
             procs: open_dir(&base.join("run-x")),
             name: "run-x".into(),
         };
+        let events = base.join("run-x/cgroup.events");
+        std::fs::write(&events, "populated 0\nfrozen 0\n").unwrap();
         std::fs::set_permissions(&base, std::os::unix::fs::PermissionsExt::from_mode(0o555))
             .unwrap();
-        let outcome = run.try_remove();
+        let known_empty = run.try_remove();
+        std::fs::remove_file(&events).unwrap();
+        let unknown = run.try_remove();
         std::fs::set_permissions(&base, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
-        assert!(matches!(outcome, Removal::GaveUp(_)), "{outcome:?}");
+        assert!(matches!(known_empty, Removal::GaveUp(_)), "{known_empty:?}");
+        assert!(matches!(unknown, Removal::Busy), "{unknown:?}");
         assert!(matches!(run.try_remove(), Removal::Removed));
         std::fs::remove_dir_all(base).unwrap();
     }

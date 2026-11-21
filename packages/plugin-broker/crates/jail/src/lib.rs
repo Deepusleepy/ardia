@@ -22,8 +22,8 @@ pub mod sys;
 
 pub use exec::{exec_main, ExecOutcome, HostHandoff, StartedSignal};
 pub use supervise::{
-    Capabilities, ExitReport, LaunchObserver, Launched, PolicyDelivery, Program, Quiet, RunId,
-    SpawnError, SpawnRequest, Supervisor, SupervisorConfig, Work,
+    Capabilities, ExitReport, FolderScripts, LaunchObserver, Launched, PolicyDelivery, Program,
+    Quiet, RunId, SpawnError, SpawnRequest, Supervisor, SupervisorConfig, Work,
 };
 
 pub const BROKER_PATH_IN_JAIL: &str = "/run/ardia/ardia-plugins";

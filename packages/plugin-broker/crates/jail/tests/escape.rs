@@ -1909,9 +1909,9 @@ fn a_script_sees_real_siblings_through_unreadable_and_crowded_folders() {
     );
 }
 
-fn noexec_wrapper(target: &Path, source: &Path) -> Vec<String> {
+fn mount_wrapper(target: &Path, source: &Path, options: &str) -> Vec<String> {
     let script = format!(
-        "mount -t tmpfs -o noexec,size=16m noexec '{}' && cp -a '{}/.' '{}/' && exec \"$@\"",
+        "mount -t tmpfs -o {options},size=16m wrapped '{}' && cp -a '{}/.' '{}/' && exec \"$@\"",
         target.display(),
         source.display(),
         target.display()
@@ -1931,6 +1931,10 @@ fn noexec_wrapper(target: &Path, source: &Path) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+fn noexec_wrapper(target: &Path, source: &Path) -> Vec<String> {
+    mount_wrapper(target, source, "noexec")
 }
 
 #[test]
@@ -2114,4 +2118,133 @@ fn scripts_inside_folders_are_refused_without_overlayfs_while_elf_sidecars_still
     assert_eq!(escaped, 0, "{elf:#?}");
     world.check_untouched();
     eprintln!("SUMMARY no_overlay script-refused elf-ran {caps}");
+}
+
+const NOSYMFOLLOW_SCRIPT: &str = "#!/bin/sh\nd=$(dirname \"$0\")\nif err=$(cat \"$d/link\" 2>&1 >/dev/null); then f=1; else f=0; fi\nopts=$(grep ' /run/ardia/program ' /proc/self/mountinfo | cut -d' ' -f6 | tr '\\n' '|')\necho \"NOSYM followed=$f opts=$opts err=$err\" >&3\necho DONE >&3\n";
+
+#[test]
+fn a_script_in_a_nosymfollow_folder_still_cant_follow_links_once_pinned() {
+    let world = World::new("nosymfollow");
+    if !userns_wrapper_works() {
+        skip(
+            "nosymfollow",
+            "the test can't make a user namespace to mount in",
+            "tool",
+        );
+        return;
+    }
+    let source = world.root.join("progs-src/sym");
+    write(&source.join("pkg/bin/run.sh"), NOSYMFOLLOW_SCRIPT);
+    write(&source.join("pkg/bin/target.txt"), "target\n");
+    std::os::unix::fs::symlink("target.txt", source.join("pkg/bin/link")).unwrap();
+    std::fs::set_permissions(
+        source.join("pkg/bin/run.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let mut outcomes = Vec::new();
+    for (label, options) in [("plain", None), ("nosymfollow", Some("nosymfollow"))] {
+        let target = world.root.join(format!("progs/sym-{label}"));
+        std::fs::create_dir_all(&target).unwrap();
+        let wrap = match options {
+            Some(options) => mount_wrapper(&target, &source, options),
+            None => {
+                std::process::Command::new("cp")
+                    .arg("-a")
+                    .arg(format!("{}/.", source.display()))
+                    .arg(&target)
+                    .status()
+                    .unwrap();
+                Vec::new()
+            }
+        };
+        let wrap: Vec<&str> = wrap.iter().map(String::as_str).collect();
+        let mut args: Vec<String> = world
+            .sim_args("sidecar", "probe")
+            .into_iter()
+            .filter(|a| !a.starts_with("program="))
+            .collect();
+        args.push(format!(
+            "program={}",
+            target.join("pkg/bin/run.sh").display()
+        ));
+        let lines = Sim::start(&world, args, &wrap).finish(Duration::from_secs(30));
+        if !script_sidecars(&format!("nosymfollow/{label}"), &lines) {
+            return;
+        }
+        let seen = lines
+            .iter()
+            .find(|l| l.starts_with("LINE NOSYM"))
+            .cloned()
+            .unwrap_or_else(|| panic!("{label}: {lines:#?}"));
+        eprintln!("SUMMARY nosymfollow/{label} {seen}");
+        outcomes.push((label, seen));
+    }
+    assert!(outcomes[0].1.contains("followed=1"), "{outcomes:?}");
+    assert!(outcomes[1].1.contains("nosymfollow"), "{outcomes:?}");
+    assert!(
+        outcomes[1].1.contains("followed=0"),
+        "a link was followed in a nosymfollow folder: {outcomes:?}"
+    );
+}
+
+#[test]
+fn a_program_the_launching_user_cant_execute_is_refused() {
+    let world = World::new("unrunnable");
+    let sudo = Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !sudo {
+        skip(
+            "unrunnable",
+            "the test needs passwordless sudo to make a root-owned script",
+            "tool",
+        );
+        return;
+    }
+    let package = world.root.join("progs/unrunnable-pkg");
+    let script = package.join("bin/run.sh");
+    write(&script, "#!/bin/sh\necho RAN >&3\necho DONE >&3\n");
+    let ok = Command::new("sudo")
+        .args(["-n", "sh", "-c"])
+        .arg(format!(
+            "chown -R 0:0 '{}' && chmod 0744 '{}'",
+            package.display(),
+            script.display()
+        ))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(ok, "couldn't prepare the root-owned script");
+    let mut args: Vec<String> = world
+        .sim_args("sidecar", "probe")
+        .into_iter()
+        .filter(|a| !a.starts_with("program="))
+        .collect();
+    args.push(format!("program={}", script.display()));
+    let lines = run_to_end(&world, args);
+    let _ = Command::new("sudo")
+        .args(["-n", "chown", "-R"])
+        .arg(format!("{}:{}", unsafe { libc::getuid() }, unsafe {
+            libc::getgid()
+        }))
+        .arg(&package)
+        .status();
+    if !full_sidecars_available(&lines) {
+        skip("unrunnable", "sidecars aren't available", "full");
+        return;
+    }
+    let refused = lines
+        .iter()
+        .find(|l| l.starts_with("REFUSED"))
+        .cloned()
+        .unwrap_or_default();
+    eprintln!("SUMMARY unrunnable {refused}");
+    assert!(!lines.iter().any(|l| l == "LINE RAN"), "{lines:#?}");
+    assert!(
+        refused.contains("can't run this program yourself"),
+        "{lines:#?}"
+    );
 }

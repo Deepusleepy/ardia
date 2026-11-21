@@ -55,6 +55,7 @@ pub struct PinnedProgram {
     pub inode: u64,
     pub script: bool,
     pub pin_with_overlay: bool,
+    pub folder_flags: u64,
 }
 
 struct Writer(Vec<u8>);
@@ -200,6 +201,7 @@ impl Frame {
                 out.bytes(program.path.as_os_str().as_bytes());
                 out.u64(program.device);
                 out.u64(program.inode);
+                out.u64(program.folder_flags);
             }
             None => out.u8(0),
         }
@@ -264,6 +266,7 @@ impl Frame {
                 inode: input.u64()?,
                 script: flag >= 2,
                 pin_with_overlay: flag == 3,
+                folder_flags: input.u64()?,
             }),
             _ => return Err(invalid("the policy frame's program flag is wrong")),
         };
@@ -383,6 +386,7 @@ mod tests {
                 inode: 77,
                 script: true,
                 pin_with_overlay: true,
+                folder_flags: libc::MS_NOSUID | libc::MS_NOATIME,
             }),
             argv: vec!["x".into(), "--serve".into()],
             env: vec!["HOME=/run/ardia/data/home".into()],

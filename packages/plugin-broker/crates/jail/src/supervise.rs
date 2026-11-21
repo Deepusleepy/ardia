@@ -63,11 +63,18 @@ impl SupervisorConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderScripts {
+    Available,
+    Unsupported(String),
+    Unknown(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct Capabilities {
     pub landlock_abi: Result<u32, Unavailable>,
     pub full_isolation: Result<(), String>,
-    pub folder_scripts: Result<(), String>,
+    pub folder_scripts: FolderScripts,
     pub launcher: Linkage,
     pub cgroup: Option<PathBuf>,
 }
@@ -240,25 +247,35 @@ impl Program {
         self.script && inside_a_folder
     }
 
-    fn refuse_noexec(&self) -> Result<(), String> {
-        let noexec = |fd: RawFd| -> Result<bool, String> {
-            let mut info: libc::statvfs = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstatvfs(fd, &mut info) } != 0 {
-                return Err(format!(
-                    "the program's filesystem can't be checked: {}",
-                    sys::last_error()
-                ));
-            }
-            Ok(info.f_flag & libc::ST_NOEXEC != 0)
-        };
+    fn granted_mount_flags(&self, folder: Option<RawFd>) -> Result<u64, String> {
         let mut places = vec![self.file.as_raw_fd()];
         places.extend(self.folder.as_ref().map(|folder| folder.as_raw_fd()));
-        for fd in places {
-            if noexec(fd)? {
-                return Err(
-                    "the program sits on a filesystem mounted noexec, so it can't run".into(),
-                );
-            }
+        places.extend(folder);
+        places.into_iter().try_fold(0, |flags, fd| {
+            sys::mount_flags_of(fd)
+                .map(|found| flags | found)
+                .map_err(|error| format!("the program's filesystem can't be checked: {error}"))
+        })
+    }
+
+    fn refuse_noexec(&self) -> Result<(), String> {
+        if self.granted_mount_flags(None)? & libc::MS_NOEXEC != 0 {
+            return Err("the program sits on a filesystem mounted noexec, so it can't run".into());
+        }
+        Ok(())
+    }
+
+    fn refuse_unrunnable(&self) -> Result<(), String> {
+        let path = sys::cstring(Path::new(&format!(
+            "/proc/self/fd/{}",
+            self.file.as_raw_fd()
+        )))
+        .map_err(|error| error.to_string())?;
+        if unsafe { libc::access(path.as_ptr(), libc::X_OK) } != 0 {
+            return Err(format!(
+                "you can't run this program yourself ({}), so the sandbox won't run it either",
+                sys::last_error()
+            ));
         }
         Ok(())
     }
@@ -616,7 +633,7 @@ impl Supervisor {
             capabilities: Capabilities {
                 landlock_abi: landlock::kernel_abi(),
                 full_isolation: Err("not probed".into()),
-                folder_scripts: Err("not probed".into()),
+                folder_scripts: FolderScripts::Unknown("not probed".into()),
                 launcher,
                 cgroup,
             },
@@ -633,7 +650,7 @@ impl Supervisor {
                 supervisor.capabilities.folder_scripts = folder_scripts;
             }
             Err(why) => {
-                supervisor.capabilities.folder_scripts = Err(why.clone());
+                supervisor.capabilities.folder_scripts = FolderScripts::Unknown(why.clone());
                 supervisor.capabilities.full_isolation = Err(why);
             }
         }
@@ -720,7 +737,7 @@ impl Supervisor {
         ])
     }
 
-    fn probe_full_isolation(&mut self) -> Result<Result<(), String>, String> {
+    fn probe_full_isolation(&mut self) -> Result<FolderScripts, String> {
         let bwrap = self.bwrap.as_ref().ok_or("no bundled bwrap")?.as_raw_fd();
         let (code, help) = self.run_once(bwrap, strings(&["ardia-bwrap", "--help"]), Vec::new())?;
         for flag in [
@@ -768,15 +785,34 @@ impl Supervisor {
         argv.extend(strings(&["--", BROKER_PATH_IN_JAIL, "exec", "--probe"]));
         let (code, output) = self.run_once(bwrap, argv, vec![(self.broker_exe.as_raw_fd(), 3)])?;
         match code {
-            0 => Ok(Ok(())),
-            crate::exec::EXIT_PROBE_WITHOUT_OVERLAY => Ok(Err(format!(
+            0 => Ok(FolderScripts::Available),
+            crate::exec::EXIT_PROBE_WITHOUT_OVERLAY => Ok(FolderScripts::Unsupported(format!(
                 "scripts inside a folder need overlayfs to keep their path, and {}",
+                output.trim()
+            ))),
+            crate::exec::EXIT_PROBE_OVERLAY_UNSURE => Ok(FolderScripts::Unknown(format!(
+                "scripts inside a folder need overlayfs, and {}",
                 output.trim()
             ))),
             _ => Err(format!(
                 "bwrap couldn't make namespaces (exit {code}): {}",
                 output.trim()
             )),
+        }
+    }
+
+    fn ensure_folder_scripts(&mut self) -> Result<(), SpawnError> {
+        if matches!(self.capabilities.folder_scripts, FolderScripts::Unknown(_)) {
+            self.capabilities.folder_scripts = match self.probe_full_isolation() {
+                Ok(state) => state,
+                Err(why) => FolderScripts::Unknown(why),
+            };
+        }
+        match &self.capabilities.folder_scripts {
+            FolderScripts::Available => Ok(()),
+            FolderScripts::Unsupported(why) | FolderScripts::Unknown(why) => Err(
+                SpawnError::Refused(format!("this script can't run here: {why}")),
+            ),
         }
     }
 
@@ -870,13 +906,7 @@ impl Supervisor {
                 .verify_destination(placement, request.plugin_dir.as_raw_fd())
                 .map_err(SpawnError::Refused)?;
             program.refuse_noexec().map_err(SpawnError::Refused)?;
-            if program.needs_overlay(placement) {
-                if let Err(why) = &self.capabilities.folder_scripts {
-                    return Err(SpawnError::Refused(format!(
-                        "this script can't run here: {why}"
-                    )));
-                }
-            }
+            program.refuse_unrunnable().map_err(SpawnError::Refused)?;
         }
         if let Work::Sidecar { program, .. } = &request.work {
             roots::refuse_nested_mounts("the plugin's data", request.data_dir.as_raw_fd())
@@ -959,6 +989,15 @@ impl Supervisor {
                     inode,
                     script: program.script,
                     pin_with_overlay,
+                    folder_flags: if pin_with_overlay {
+                        let plugin = matches!(placement, ProgramPlacement::InsidePluginFolder)
+                            .then(|| request.plugin_dir.as_raw_fd());
+                        program
+                            .granted_mount_flags(plugin)
+                            .map_err(SpawnError::Refused)?
+                    } else {
+                        0
+                    },
                 });
                 frame.final_filter =
                     seccomp::to_bytes(&seccomp::compile(&seccomp::sidecar_offline(abi))?);
@@ -1102,6 +1141,11 @@ impl Supervisor {
             .admit(self.runs.len(), Instant::now())
             .map_err(SpawnError::Busy)?;
         let placement = self.check_request(&request)?;
+        if let Work::Sidecar { program, .. } = &request.work {
+            if program.needs_overlay(placement) {
+                self.ensure_folder_scripts()?;
+            }
+        }
         sys::mkdir_at(request.data_dir.as_raw_fd(), "home", 0o700)?;
         sys::mkdir_at(request.data_dir.as_raw_fd(), "tmp", 0o700)?;
 

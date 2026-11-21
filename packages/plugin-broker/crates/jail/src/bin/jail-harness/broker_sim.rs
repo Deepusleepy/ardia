@@ -214,10 +214,11 @@ pub fn main(args: &[String]) -> i32 {
             .as_ref()
             .map(|_| "ok".to_string())
             .unwrap_or_else(|why| format!("no:{why}")),
-        caps.folder_scripts
-            .as_ref()
-            .map(|_| "ok".to_string())
-            .unwrap_or_else(|why| format!("no:{why}"))
+        match &caps.folder_scripts {
+            jail::FolderScripts::Available => "ok".to_string(),
+            jail::FolderScripts::Unsupported(why) => format!("no:{why}"),
+            jail::FolderScripts::Unknown(why) => format!("unknown:{why}"),
+        }
     ));
 
     let mut pair = [0; 2];

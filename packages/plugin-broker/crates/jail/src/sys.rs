@@ -7,6 +7,28 @@ use std::time::Instant;
 
 pub const CLOSE_RANGE_UNSHARE: u32 = 2;
 pub const CLOSE_RANGE_CLOEXEC: u32 = 4;
+pub const MS_NOSYMFOLLOW: libc::c_ulong = 256;
+pub const ST_NOSYMFOLLOW: libc::c_ulong = 0x2000;
+pub const ST_RELATIME: libc::c_ulong = 0x1000;
+
+pub fn mount_flags_of(fd: RawFd) -> io::Result<u64> {
+    let mut info: libc::statvfs = unsafe { std::mem::zeroed() };
+    check(unsafe { libc::fstatvfs(fd, &mut info) })?;
+    let flag = info.f_flag as libc::c_ulong;
+    let pairs: [(libc::c_ulong, libc::c_ulong); 7] = [
+        (libc::ST_NOSUID, libc::MS_NOSUID),
+        (libc::ST_NODEV, libc::MS_NODEV),
+        (libc::ST_NOEXEC, libc::MS_NOEXEC),
+        (libc::ST_NOATIME, libc::MS_NOATIME),
+        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        (ST_RELATIME, libc::MS_RELATIME),
+        (ST_NOSYMFOLLOW, MS_NOSYMFOLLOW),
+    ];
+    Ok(pairs
+        .iter()
+        .filter(|(st, _)| flag & st != 0)
+        .fold(0, |flags, (_, ms)| flags | *ms))
+}
 
 pub fn last_error() -> io::Error {
     io::Error::last_os_error()

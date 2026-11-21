@@ -1177,8 +1177,8 @@ fn a_script_program_runs_from_its_pinned_fd() {
     assert!(ran.contains("args=probe"), "{ran}");
     assert!(ran.contains("home=/run/ardia/data/home"), "{ran}");
     assert!(
-        ran.contains("self=/run/ardia/exec/bin/hello.sh"),
-        "the script should keep its layout under the pinned stage: {ran}"
+        ran.contains("self=/run/ardia/program/bin/hello.sh"),
+        "the script should keep its own path: {ran}"
     );
     assert!(
         lines.iter().any(|l| l == "LINE REREAD #!/bin/sh"),
@@ -1797,7 +1797,10 @@ fn a_script_sources_its_siblings_and_keeps_running_the_verified_copy_after_a_ren
         std::fs::read_to_string(&script).unwrap().contains("DECOY"),
         "the host copy wasn't replaced"
     );
-    assert!(after.contains("self=/run/ardia/exec/bin/run.sh"), "{after}");
+    assert!(
+        after.contains("self=/run/ardia/program/bin/run.sh"),
+        "{after}"
+    );
     assert!(
         after.contains("setup=sourced"),
         "the sibling wasn't sourced: {after}"
@@ -1813,5 +1816,68 @@ fn a_script_sources_its_siblings_and_keeps_running_the_verified_copy_after_a_ren
     assert!(
         !lines.iter().any(|l| l.contains("DECOY")),
         "the replacement ran: {lines:#?}"
+    );
+}
+
+#[test]
+fn a_script_sees_real_siblings_through_unreadable_and_crowded_folders() {
+    let world = World::new("crowded-script");
+    let package = world.root.join("progs/crowd-pkg");
+    let script = package.join("bin/run.sh");
+    write(&package.join("lib/setup.sh"), "SETUP=sourced\n");
+    write(&package.join("bin/helper.sh"), "echo helped\n");
+    write(
+        &script,
+        "#!/bin/sh\n. \"$(dirname \"$0\")/../lib/setup.sh\"\nfound=$(find \"$(dirname \"$0\")/../lib\" \"$(dirname \"$0\")/helper.sh\" -type f 2>/dev/null | wc -l)\nhelper=$(sh \"$(dirname \"$0\")/helper.sh\")\ntouch \"$(dirname \"$0\")/new\" 2>/dev/null && echo WROTE-PROGRAM >&3\nprintf '#!/bin/sh\\necho RAN\\n' > \"$HOME/t.sh\"; chmod 755 \"$HOME/t.sh\"; \"$HOME/t.sh\" >/dev/null 2>&1; data_exec=$?\necho \"CROWD self=$0 setup=$SETUP found=$found helper=$helper data_exec=$data_exec\" >&3\necho DONE >&3\n",
+    );
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    for index in 0..5000 {
+        std::fs::write(package.join(format!("bin/crowd-{index:04}")), "").unwrap();
+    }
+    std::fs::set_permissions(
+        package.join("bin"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o111),
+    )
+    .unwrap();
+    let mut args: Vec<String> = world
+        .sim_args("sidecar", "probe")
+        .into_iter()
+        .filter(|a| !a.starts_with("program="))
+        .collect();
+    args.push(format!("program={}", script.display()));
+    args.push("probe=crowded".into());
+    let lines = run_to_end(&world, args);
+    std::fs::set_permissions(
+        package.join("bin"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    if !full_sidecars_available(&lines) {
+        skip("crowded_script", "sidecars aren't available", "full");
+        return;
+    }
+    let crowd = lines
+        .iter()
+        .find(|l| l.starts_with("LINE CROWD"))
+        .cloned()
+        .unwrap_or_else(|| panic!("{lines:#?}"));
+    eprintln!("SUMMARY crowded_script {crowd}");
+    assert!(
+        crowd.contains("self=/run/ardia/program/bin/run.sh"),
+        "{crowd}"
+    );
+    assert!(crowd.contains("setup=sourced"), "{crowd}");
+    assert!(
+        crowd.contains("found=2"),
+        "find -type f should see the real helper files: {crowd}"
+    );
+    assert!(crowd.contains("helper=helped"), "{crowd}");
+    assert!(
+        crowd.contains("data_exec=126"),
+        "Landlock should still refuse running files from the data folder: {crowd}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("WROTE-PROGRAM")),
+        "{lines:#?}"
     );
 }

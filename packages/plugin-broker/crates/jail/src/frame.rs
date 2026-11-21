@@ -54,6 +54,7 @@ pub struct PinnedProgram {
     pub device: u64,
     pub inode: u64,
     pub script: bool,
+    pub pin_with_overlay: bool,
 }
 
 struct Writer(Vec<u8>);
@@ -191,7 +192,11 @@ impl Frame {
         out.target(&self.cwd);
         match &self.program {
             Some(program) => {
-                out.u8(if program.script { 2 } else { 1 });
+                out.u8(match (program.script, program.pin_with_overlay) {
+                    (false, _) => 1,
+                    (true, false) => 2,
+                    (true, true) => 3,
+                });
                 out.bytes(program.path.as_os_str().as_bytes());
                 out.u64(program.device);
                 out.u64(program.inode);
@@ -253,11 +258,12 @@ impl Frame {
         let cwd = input.target()?;
         let program = match input.u8()? {
             0 => None,
-            flag @ (1 | 2) => Some(PinnedProgram {
+            flag @ (1..=3) => Some(PinnedProgram {
                 path: input.path()?,
                 device: input.u64()?,
                 inode: input.u64()?,
-                script: flag == 2,
+                script: flag >= 2,
+                pin_with_overlay: flag == 3,
             }),
             _ => return Err(invalid("the policy frame's program flag is wrong")),
         };
@@ -376,6 +382,7 @@ mod tests {
                 device: 2049,
                 inode: 77,
                 script: true,
+                pin_with_overlay: true,
             }),
             argv: vec!["x".into(), "--serve".into()],
             env: vec!["HOME=/run/ardia/data/home".into()],

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -377,17 +378,18 @@ pub struct Supervisor {
     devnull: OwnedFd,
 }
 
-fn cstrings(items: &[String]) -> io::Result<Vec<CString>> {
+fn cstrings<T: AsRef<OsStr>>(items: &[T]) -> io::Result<Vec<CString>> {
     items
         .iter()
         .map(|item| {
-            CString::new(item.as_bytes()).map_err(|_| sys::invalid("an argument holds a NUL byte"))
+            CString::new(item.as_ref().as_bytes())
+                .map_err(|_| sys::invalid("an argument holds a NUL byte"))
         })
         .collect()
 }
 
-fn strings(items: &[&str]) -> Vec<String> {
-    items.iter().map(|item| item.to_string()).collect()
+fn strings(items: &[&str]) -> Vec<OsString> {
+    items.iter().map(OsString::from).collect()
 }
 
 fn valid_env_name(name: &str) -> bool {
@@ -548,7 +550,7 @@ fn decode_status(level: Level, status: libc::c_int) -> (Option<i32>, Option<i32>
 
 struct Prepared {
     exe: RawFd,
-    argv: Vec<String>,
+    argv: Vec<OsString>,
     envp: Vec<String>,
     frame: Frame,
     fds: Vec<(RawFd, RawFd)>,
@@ -605,7 +607,7 @@ impl Supervisor {
     fn run_once(
         &mut self,
         exe: RawFd,
-        argv: Vec<String>,
+        argv: Vec<OsString>,
         extra: Vec<(RawFd, RawFd)>,
     ) -> Result<(i32, String), String> {
         let (out_r, pipe_w) = sys::pipe().map_err(|e| e.to_string())?;
@@ -657,7 +659,7 @@ impl Supervisor {
         Ok((code, String::from_utf8_lossy(&output).into_owned()))
     }
 
-    fn namespace_flags() -> Vec<String> {
+    fn namespace_flags() -> Vec<OsString> {
         strings(&[
             "--unshare-user",
             "--unshare-ipc",
@@ -696,7 +698,7 @@ impl Supervisor {
                 ));
             }
         }
-        let mut argv = vec!["ardia-bwrap".to_string()];
+        let mut argv = vec![OsString::from("ardia-bwrap")];
         argv.extend(Self::namespace_flags());
         let mut entries = plan::system_entries(RunKind::Host);
         entries.push(plan::Entry {
@@ -893,20 +895,27 @@ impl Supervisor {
                 frame.env = Self::sidecar_environment(request)?;
                 let jail_path = program.jail_path(placement, &plugin_path)?;
                 let (device, inode) = sys::identity(program.file.as_raw_fd())?;
+                let inside_a_folder = matches!(placement, ProgramPlacement::InsidePluginFolder)
+                    || (matches!(placement, ProgramPlacement::Separate)
+                        && program.folder.is_some());
+                let pin_with_overlay = program.script && inside_a_folder;
                 frame.program = Some(PinnedProgram {
                     path: jail_path.clone(),
                     device,
                     inode,
                     script: program.script,
+                    pin_with_overlay,
                 });
-                frame.expected_mounts.push(jail_path.clone());
                 frame.final_filter =
                     seccomp::to_bytes(&seccomp::compile(&seccomp::sidecar_offline(abi))?);
-                fds.push((
-                    lift(program.file.as_raw_fd(), &mut held)?,
-                    PROGRAM_FD_IN_JAIL,
-                ));
-                program_file = Some((PROGRAM_FD_IN_JAIL, jail_path));
+                if !pin_with_overlay {
+                    frame.expected_mounts.push(jail_path.clone());
+                    fds.push((
+                        lift(program.file.as_raw_fd(), &mut held)?,
+                        PROGRAM_FD_IN_JAIL,
+                    ));
+                    program_file = Some((PROGRAM_FD_IN_JAIL, jail_path));
+                }
             }
         }
         if level == Level::HostReduced {
@@ -980,10 +989,14 @@ impl Supervisor {
         frame.rules.extend(plan.landlock_rules());
         frame.mount_checks = plan.mount_checks();
         frame.private_mounts = true;
-        let mut argv = vec!["ardia-bwrap".to_string()];
+        let mut argv = vec![OsString::from("ardia-bwrap")];
         argv.extend(Self::namespace_flags());
         for (name, value) in &launcher_env {
-            argv.extend(["--setenv".to_string(), name.clone(), value.clone()]);
+            argv.extend([
+                OsString::from("--setenv"),
+                OsString::from(name),
+                OsString::from(value),
+            ]);
         }
         argv.extend(strings(&[
             "--info-fd",
@@ -1409,7 +1422,7 @@ impl Supervisor {
     }
 }
 
-fn reap_independently(stragglers: &mut Vec<Straggler>, deadline: Instant) {
+fn reap_independently(stragglers: &mut Vec<Straggler>, deadline: Option<Instant>) {
     loop {
         stragglers.retain_mut(|straggler| {
             if let Some(pid) = straggler.pid {
@@ -1428,25 +1441,41 @@ fn reap_independently(stragglers: &mut Vec<Straggler>, deadline: Instant) {
             }
             straggler.pid.is_some() || straggler.cgroup.is_some()
         });
-        if stragglers.is_empty() || Instant::now() >= deadline {
+        if stragglers.is_empty() || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        let pause = if deadline.is_some() { 20 } else { 250 };
+        std::thread::sleep(Duration::from_millis(pause));
     }
 }
 
 impl Drop for Supervisor {
     fn drop(&mut self) {
         self.shutdown(QUIT_GRACE);
-        self.spawner.reap_orphans();
         let mut left = std::mem::take(&mut self.stragglers);
-        reap_independently(&mut left, Instant::now() + TEARDOWN_DEADLINE);
-        if !left.is_empty() {
-            let _ = std::thread::Builder::new()
-                .name("jail-straggler-reaper".into())
-                .spawn(move || {
-                    reap_independently(&mut left, Instant::now() + Duration::from_secs(600));
-                });
+        left.extend(
+            self.spawner
+                .take_orphans()
+                .into_iter()
+                .map(|pid| Straggler {
+                    pid: Some(pid),
+                    _pidfd: None,
+                    cgroup: None,
+                }),
+        );
+        reap_independently(&mut left, Some(Instant::now() + TEARDOWN_DEADLINE));
+        if left.is_empty() {
+            return;
+        }
+        let count = left.len();
+        let started = std::thread::Builder::new()
+            .name("jail-straggler-reaper".into())
+            .spawn(move || reap_independently(&mut left, None));
+        if let Err(error) = started {
+            let _ = sys::write_all(
+                2,
+                format!("[ardia] the straggler reaper couldn't start ({error}), so {count} sandbox processes or cgroups stay unreaped\n").as_bytes(),
+            );
         }
     }
 }
@@ -1484,7 +1513,10 @@ mod tests {
             },
         ];
         let started = Instant::now();
-        reap_independently(&mut stragglers, Instant::now() + Duration::from_millis(800));
+        reap_independently(
+            &mut stragglers,
+            Some(Instant::now() + Duration::from_millis(800)),
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(
             stragglers.len(),
@@ -1497,7 +1529,10 @@ mod tests {
             "the quick child is still a zombie"
         );
         unsafe { libc::kill(slow, libc::SIGKILL) };
-        reap_independently(&mut stragglers, Instant::now() + Duration::from_secs(2));
+        reap_independently(
+            &mut stragglers,
+            Some(Instant::now() + Duration::from_secs(2)),
+        );
         assert!(stragglers.is_empty());
     }
 

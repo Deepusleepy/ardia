@@ -246,88 +246,98 @@ fn mount_call(
     Ok(())
 }
 
-const STAGE_ENTRY_LIMIT: usize = 4096;
+pub const SCRIPT_COPY_LIMIT: u64 = 16 << 20;
 
-fn stage_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<PathBuf> {
-    let stage = Path::new(crate::EXEC_STAGE_IN_JAIL);
-    let (root, relative) = match (
-        program.path.strip_prefix(crate::PROGRAM_IN_JAIL),
-        program.path.strip_prefix(crate::PLUGIN_IN_JAIL),
-    ) {
-        (Ok(relative), _) => (Path::new(crate::PROGRAM_IN_JAIL), relative),
-        (_, Ok(relative)) => (Path::new(crate::PLUGIN_IN_JAIL), relative),
-        _ => return Ok(program.path.clone()),
-    };
-    let parts: Vec<&std::ffi::OsStr> = relative
-        .components()
-        .map(|part| match part {
-            std::path::Component::Normal(name) => Ok(name),
-            _ => Err(sys::invalid("the script's path isn't plain")),
-        })
-        .collect::<io::Result<_>>()?;
-    if parts.is_empty() {
-        return Err(sys::invalid("the script's path is empty"));
+fn read_verified(fd: &OwnedFd, limit: u64) -> io::Result<(Vec<u8>, u32)> {
+    let info = sys::fstat(fd.as_raw_fd())?;
+    if info.st_size as u64 > limit {
+        return Err(sys::invalid("the script is over 16 MB"));
     }
-    let nosuid_nodev = libc::MS_NOSUID | libc::MS_NODEV;
-    mount_call(
-        None,
-        stage,
-        Some(c"tmpfs"),
-        nosuid_nodev,
-        Some(c"size=1m,mode=0755"),
-    )?;
-    let mut real = root.to_path_buf();
-    let mut staged = stage.to_path_buf();
-    for (index, part) in parts.iter().enumerate() {
-        let mut linked = 0;
-        for entry in std::fs::read_dir(&real)? {
-            let name = entry?.file_name();
-            if name.as_os_str() == *part {
+    let mut bytes = vec![0u8; info.st_size as usize];
+    let mut done = 0;
+    while done < bytes.len() {
+        let count = unsafe {
+            libc::pread(
+                fd.as_raw_fd(),
+                bytes[done..].as_mut_ptr().cast(),
+                bytes.len() - done,
+                done as libc::off_t,
+            )
+        };
+        if count < 0 {
+            let error = sys::last_error();
+            if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            linked += 1;
-            if linked > STAGE_ENTRY_LIMIT {
-                return Err(sys::invalid(
-                    "the script's folder has too many entries to stage",
-                ));
-            }
-            std::os::unix::fs::symlink(real.join(&name), staged.join(&name))?;
+            return Err(error);
         }
-        real.push(part);
-        staged.push(part);
-        if index + 1 < parts.len() {
-            std::fs::create_dir(&staged)?;
+        if count == 0 {
+            return Err(sys::invalid("the script shrank while it was copied"));
         }
+        done += count as usize;
     }
-    std::fs::File::create(&staged)?;
-    let source = PathBuf::from(format!("/proc/self/fd/{}", verified.as_raw_fd()));
-    mount_call(Some(&source), &staged, None, libc::MS_BIND, None)?;
-    let read_only = libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | nosuid_nodev;
-    mount_call(None, &staged, None, read_only, None)?;
+    Ok((bytes, info.st_mode & 0o755))
+}
+
+fn pin_script(program: &PinnedProgram, verified: &OwnedFd) -> io::Result<()> {
+    let Some((root, relative)) = overlay_root(program) else {
+        return Ok(());
+    };
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(sys::invalid("the script's path isn't plain"));
+    }
+    let (bytes, mode) = read_verified(verified, SCRIPT_COPY_LIMIT)?;
+    let layer = Path::new(crate::EXEC_STAGE_IN_JAIL);
+    let nosuid_nodev = libc::MS_NOSUID | libc::MS_NODEV;
+    let size = std::ffi::CString::new(format!("size={},mode=0755", bytes.len() + (1 << 20)))
+        .map_err(|_| sys::invalid("the layer options hold a NUL byte"))?;
+    mount_call(None, layer, Some(c"tmpfs"), nosuid_nodev, Some(&size))?;
+    let copy = layer.join(relative);
+    if let Some(parent) = copy.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&copy, &bytes)?;
+    std::fs::set_permissions(&copy, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
     mount_call(
         None,
-        stage,
+        layer,
         None,
         libc::MS_REMOUNT | libc::MS_RDONLY | nosuid_nodev,
         None,
     )?;
+    let options =
+        std::ffi::CString::new(format!("lowerdir={}:{}", layer.display(), root.display()))
+            .map_err(|_| sys::invalid("the overlay options hold a NUL byte"))?;
+    mount_call(
+        Some(Path::new("ardia-pinned")),
+        root,
+        Some(c"overlay"),
+        libc::MS_RDONLY | nosuid_nodev,
+        Some(&options),
+    )?;
     let again = sys::openat(
         libc::AT_FDCWD,
-        &staged,
+        &program.path,
         libc::O_RDONLY | libc::O_NOFOLLOW,
         0,
     )?;
-    if sys::identity(again.as_raw_fd())? != (program.device, program.inode) {
-        return Err(sys::invalid("the staged script isn't the verified one"));
-    }
-    let entries = roots::read_mountinfo()?;
-    let mount = mount_root(&entries, &staged)?;
-    if sys::mount_id(again.as_raw_fd())? != mount.id || !mount.read_only() || mount.propagates() {
+    if read_verified(&again, SCRIPT_COPY_LIMIT)?.0 != bytes {
         return Err(sys::invalid(
-            "the staged script isn't on its own read-only, private mount",
+            "the pinned script doesn't read back as the verified bytes",
         ));
     }
-    Ok(staged)
+    let entries = roots::read_mountinfo()?;
+    let mount = mount_root(&entries, root)?;
+    if sys::mount_id(again.as_raw_fd())? != mount.id || !mount.read_only() || mount.propagates() {
+        return Err(sys::invalid(
+            "the pinned script isn't on its own read-only, private overlay",
+        ));
+    }
+    Ok(())
 }
 
 fn drop_capabilities() -> io::Result<()> {
@@ -442,14 +452,32 @@ fn open_program(program: &PinnedProgram, private_mounts: bool) -> io::Result<Own
     }
     if private_mounts {
         let entries = roots::read_mountinfo()?;
-        let mount = mount_root(&entries, &program.path)?;
+        let expected = match overlay_root(program) {
+            Some((root, _)) => root.to_path_buf(),
+            None => program.path.clone(),
+        };
+        let mount = mount_root(&entries, &expected)?;
         if sys::mount_id(fd.as_raw_fd())? != mount.id || !mount.read_only() || mount.propagates() {
             return Err(sys::invalid(
-                "the program didn't come from its own read-only, private mount",
+                "the program didn't come from its expected read-only, private mount",
             ));
         }
     }
     Ok(fd)
+}
+
+fn overlay_root(program: &PinnedProgram) -> Option<(&'static Path, &Path)> {
+    if !program.pin_with_overlay {
+        return None;
+    }
+    match (
+        program.path.strip_prefix(crate::PROGRAM_IN_JAIL),
+        program.path.strip_prefix(crate::PLUGIN_IN_JAIL),
+    ) {
+        (Ok(relative), _) => Some((Path::new(crate::PROGRAM_IN_JAIL), relative)),
+        (_, Ok(relative)) => Some((Path::new(crate::PLUGIN_IN_JAIL), relative)),
+        _ => None,
+    }
 }
 
 fn enter(policy: OwnedFd) -> Result<HostHandoff, Failure> {
@@ -461,13 +489,15 @@ fn enter(policy: OwnedFd) -> Result<HostHandoff, Failure> {
         sys::die_with_parent(frame.expected_parent).map_err(fail("parent-gone"))?;
     }
     sys::set_no_new_privs().map_err(fail("no-new-privs"))?;
-    let mut staged_script = None;
+    let mut script_path = None;
     let mut verified_early = None;
     if frame.private_mounts {
         make_mounts_private().map_err(fail("private-mounts"))?;
+        check_mount_view(&frame).map_err(fail("unexpected-mount"))?;
         if let Some(program) = frame.program.as_ref().filter(|program| program.script) {
             let fd = open_program(program, true).map_err(fail("program-identity"))?;
-            staged_script = Some(stage_script(program, &fd).map_err(fail("script-stage"))?);
+            pin_script(program, &fd).map_err(fail("script-pin"))?;
+            script_path = Some(program.path.clone());
             verified_early = Some(fd);
         }
         drop_capabilities().map_err(fail("private-mounts"))?;
@@ -498,7 +528,9 @@ fn enter(policy: OwnedFd) -> Result<HostHandoff, Failure> {
             )),
         });
     }
-    check_mount_view(&frame).map_err(fail("unexpected-mount"))?;
+    if !frame.private_mounts {
+        check_mount_view(&frame).map_err(fail("unexpected-mount"))?;
+    }
     let entry = check_entry(&frame).map_err(fail("entry-check"))?;
     let program_fd = match (&frame.program, verified_early) {
         (Some(_), Some(fd)) => Some(fd),
@@ -525,12 +557,6 @@ fn enter(policy: OwnedFd) -> Result<HostHandoff, Failure> {
     if let Some(fd) = &program_fd {
         rules.push((fd.as_raw_fd(), landlock::READ_FILE | landlock::EXECUTE));
     }
-    if staged_script.is_some() {
-        let stage =
-            sys::open_path(Path::new(crate::EXEC_STAGE_IN_JAIL)).map_err(fail("script-stage"))?;
-        rules.push((stage.as_raw_fd(), landlock::READ));
-        opened.push(stage);
-    }
     landlock::restrict_self(frame.landlock_abi, &rules).map_err(fail("landlock"))?;
     drop(opened);
     if frame.kind == RunKind::Sidecar {
@@ -554,10 +580,10 @@ fn enter(policy: OwnedFd) -> Result<HostHandoff, Failure> {
                 .map_err(fail("ready-fd"))?;
             sys::check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })
                 .map_err(fail("program-fd"))?;
-            let launch = Launch::prepare(&fd, staged_script.as_deref(), &frame.argv, &frame.env)
+            let launch = Launch::prepare(&fd, script_path.as_deref(), &frame.argv, &frame.env)
                 .map_err(fail("argv"))?;
             sys::write_all(READY_FD, accepted.as_bytes()).map_err(fail("accepted"))?;
-            launch.run(&frame.argv)
+            launch.exec_past_point_of_no_return(&frame.argv)
         }
         (RunKind::Sidecar, _, _) => Err(Failure {
             code: "program-missing",
@@ -608,7 +634,7 @@ impl Launch {
         })
     }
 
-    fn run(self, argv: &[String]) -> ! {
+    fn exec_past_point_of_no_return(self, argv: &[String]) -> ! {
         match &self.path {
             Some(path) => unsafe {
                 libc::execve(

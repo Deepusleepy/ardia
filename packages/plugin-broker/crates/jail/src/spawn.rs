@@ -222,6 +222,13 @@ impl Spawner {
 }
 
 impl Spawner {
+    pub fn take_orphans(&self) -> Vec<i32> {
+        self.orphans
+            .lock()
+            .map(|mut list| std::mem::take(&mut *list))
+            .unwrap_or_default()
+    }
+
     pub fn reap_orphans(&self) -> usize {
         let Ok(mut list) = self.orphans.lock() else {
             return 0;

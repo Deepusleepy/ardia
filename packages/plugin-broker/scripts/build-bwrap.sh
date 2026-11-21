@@ -4,8 +4,8 @@ set -euo pipefail
 BWRAP_VERSION=0.13.1
 BWRAP_SHA256=0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d
 BWRAP_PATCH=bwrap-die-with-parent-race.patch
-BWRAP_PATCH_SHA256=7d6e026f875389a4b9981ed2fefa5fb88382262346ad0d9848078d252220a4b4
-BWRAP_OUTPUT_SHA256=8b7bf6888fc6b8dac6f3437292721c02c6826843506b1714b69b3219193efa70
+BWRAP_PATCH_SHA256=89669a62ce576330375c9f760d571a61f19bdc3ed2983759a40c6b7e8232a224
+BWRAP_OUTPUT_SHA256=b5514df5347e5954b394edac20fd3445d4df0e850bc0b80a807cc7f4fc54b7c4
 BWRAP_URL="https://github.com/containers/bubblewrap/releases/download/v${BWRAP_VERSION}/bubblewrap-${BWRAP_VERSION}.tar.xz"
 ALPINE_IMAGE=alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 REQUIRED_FLAGS=(--ro-bind-fd --bind-fd --add-seccomp-fd --block-fd --info-fd --disable-userns --size --die-with-parent)

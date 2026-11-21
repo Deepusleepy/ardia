@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
@@ -211,27 +212,30 @@ impl Plan {
             .collect()
     }
 
-    pub fn bwrap_mounts(&self) -> Vec<String> {
-        let mut args = Vec::new();
-        let mut push = |items: &[&str]| args.extend(items.iter().map(|item| item.to_string()));
+    pub fn bwrap_mounts(&self) -> Vec<OsString> {
+        let mut args: Vec<OsString> = Vec::new();
+        let mut push = |items: &[&OsStr]| args.extend(items.iter().map(|item| item.to_os_string()));
         for entry in &self.entries {
-            let dest = entry.dest.to_string_lossy().into_owned();
+            let dest = entry.dest.as_os_str();
+            let os = |text: &str| OsString::from(text);
             match &entry.source {
-                Source::System => push(&["--ro-bind", &dest, &dest]),
+                Source::System => push(&[&os("--ro-bind"), dest, dest]),
                 Source::Fd { fd, writable } => {
                     let flag = if *writable {
                         "--bind-fd"
                     } else {
                         "--ro-bind-fd"
                     };
-                    push(&[flag, &fd.to_string(), &dest]);
+                    push(&[&os(flag), &os(&fd.to_string()), dest]);
                 }
-                Source::Tmpfs { bytes } => push(&["--size", &bytes.to_string(), "--tmpfs", &dest]),
-                Source::Proc => push(&["--proc", &dest]),
-                Source::Dev => push(&["--dev", &dest]),
-                Source::Symlink(target) => push(&["--symlink", &target.to_string_lossy(), &dest]),
+                Source::Tmpfs { bytes } => {
+                    push(&[&os("--size"), &os(&bytes.to_string()), &os("--tmpfs"), dest])
+                }
+                Source::Proc => push(&[&os("--proc"), dest]),
+                Source::Dev => push(&[&os("--dev"), dest]),
+                Source::Symlink(target) => push(&[&os("--symlink"), target.as_os_str(), dest]),
                 Source::Present => {}
-                Source::Dir => push(&["--dir", &dest]),
+                Source::Dir => push(&[&os("--dir"), dest]),
             }
         }
         args.push("--remount-ro".into());
@@ -282,7 +286,7 @@ mod tests {
                 .unwrap();
             if entry.source != Source::Present {
                 assert!(
-                    mounts.iter().any(|arg| arg == &path.to_string_lossy()),
+                    mounts.iter().any(|arg| arg.as_os_str() == path.as_os_str()),
                     "{path:?} is ruled but not mounted"
                 );
             }
@@ -344,6 +348,25 @@ mod tests {
                 entry.dest
             );
         }
+    }
+
+    #[test]
+    fn non_utf8_paths_reach_bwrap_unchanged() {
+        use std::os::unix::ffi::OsStrExt;
+        let odd = PathBuf::from(OsStr::from_bytes(b"/run/odd\xffname"));
+        let plan = Plan {
+            entries: vec![Entry {
+                dest: odd.clone(),
+                source: Source::System,
+                rights: 0,
+            }],
+        };
+        let mounts = plan.bwrap_mounts();
+        assert_eq!(
+            std::os::unix::ffi::OsStrExt::as_bytes(mounts[1].as_os_str()),
+            b"/run/odd\xffname"
+        );
+        assert_eq!(mounts[2].as_os_str(), odd.as_os_str());
     }
 
     #[test]

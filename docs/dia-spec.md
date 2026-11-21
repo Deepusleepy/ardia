@@ -437,7 +437,7 @@ recording: of three unpinned tabs, the two unselected close and the selected one
   - Open: the panel grows out of the field's box. Its left edge per 60fps frame (px at 2x): 676 (the field) → 674, 624,
     609, 601, 598, 595, 594, i.e. 63%, 82%, 92%, 95%, 99% of the way: an exponential ease-out of about 130ms (ours:
     `Easing.out(Easing.exp)`, 130ms). Height grows with it. The content doesn't scale or move: the growing shape
-    uncovers it.
+    uncovers it. Ardia doesn't copy this (issue #3283): its panel opens at full size on the first frame.
 
 ### Logo (orb), measured from a same-screen capture
 

@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@string/ardia_build_commit,@string/ardia_build_dirty,@string/ardia_build_source,@string/ardia_build_native,@string/ardia_release_version,@bool/ardia_sync_offered,@drawable/assets_*,@raw/assets_*" />

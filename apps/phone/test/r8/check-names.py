@@ -180,7 +180,7 @@ for root_dir in (repo / 'apps/phone/android/app/src/main', repo / 'packages/phon
                 continue
             for res_file in folder.iterdir():
                 if res_file.is_file():
-                    expected_resources.add(f'{base_type}/{res_file.stem}')
+                    expected_resources.add(f'{base_type}/{res_file.name.split(".", 1)[0]}')
 
 lost_resources = missing_resources(expected_resources, values)
 print(f'runtime & app resources: {len(expected_resources)}, {len(lost_resources)} missing')

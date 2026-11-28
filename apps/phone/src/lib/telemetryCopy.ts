@@ -210,8 +210,8 @@ export const PHONE_WHATS_SENT: { title: string; items: SentItem[] }[] = [
         fields: ["bar_load_washes"],
       },
       {
-        text: "In the same daily counts, on Android: how often the content blocker installed a compacted rule engine. Counts only, never which lists or sites",
-        fields: ["blocker_engines_compacted"],
+        text: "In the same daily counts, on Android: how often the content blocker built and installed its rule engine. Counts only, never which lists or sites",
+        fields: ["blocker_engines_installed"],
       },
     ],
   },

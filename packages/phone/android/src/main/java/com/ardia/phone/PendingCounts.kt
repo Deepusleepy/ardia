@@ -43,7 +43,7 @@ object PendingCounts {
     const val TABS_SENT = "tabs_sent"
     const val GLASS_SHADERS_FAILED = "glass_shaders_failed"
     const val GLASS_UNSOURCED = "glass_unsourced"
-    const val BLOCKER_ENGINES_COMPACTED = "blocker_engines_compacted"
+    const val BLOCKER_ENGINES_INSTALLED = "blocker_engines_installed"
     const val NIGHT_SHADE_VERDICTS_REUSED = "night_shade_verdicts_reused"
     const val NIGHT_SHADE_VERDICTS_LEARNED = "night_shade_verdicts_learned"
     const val NIGHT_SHADE_VERDICTS_CORRECTED = "night_shade_verdicts_corrected"
@@ -92,7 +92,7 @@ object PendingCounts {
 
     fun glassUnsourced(app: Context, write: (() -> Unit) -> Unit = offMain): () -> Unit = counter(app, GLASS_UNSOURCED, write)
 
-    fun blockerEnginesCompacted(app: Context, write: (() -> Unit) -> Unit = offMain): () -> Unit = counter(app, BLOCKER_ENGINES_COMPACTED, write)
+    fun blockerEnginesInstalled(app: Context, write: (() -> Unit) -> Unit = offMain): () -> Unit = counter(app, BLOCKER_ENGINES_INSTALLED, write)
 
     fun peek(context: Context): Map<String, Int> = synchronized(this) { store(context).all() }
 

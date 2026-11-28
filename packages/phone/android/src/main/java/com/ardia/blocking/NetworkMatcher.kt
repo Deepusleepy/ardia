@@ -112,7 +112,6 @@ internal class NetworkRule(
         private const val FLAG_HOST_ONLY = 1 shl 5
         private const val SHIFT_PARTY = 6
         private const val SHIFT_ANCHOR = 8
-        private const val SEPARATOR_PATTERN = "^"
 
         fun from(
             filter: NetworkFilter,
@@ -120,7 +119,7 @@ internal class NetworkRule(
             regex: MeteredRegex?,
             domainIntern: HashMap<DomainKey, LongArray>? = null,
         ): NetworkRule {
-            val pattern = if (filter.pattern == SEPARATOR_PATTERN) SEPARATOR_PATTERN else filter.pattern
+            val pattern = filter.pattern
             val hostOnly = filter.host != null && !filter.anchorEnd && pattern.length == 1 && pattern[0] == '^'
             val wholeUrl = regex != null && ListRegex.dependsOnInputEnd(pattern)
             var flags = 0

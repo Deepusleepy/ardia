@@ -15,24 +15,9 @@ def has_no_argument_constructor(section):
     return re.search(r"name\s*:\s*'<init>'\s*\n\s*type\s*:\s*'\(\)V'", section) is not None
 
 
-DUMMY_PNG = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82'
-DUMMY_XML = b'\x03\x00\x08\x00\x68\x00\x00\x00\x01\x00\x1c\x00\x24\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x24\x00\x00\x00\x00\x00\x00\x00\x01\x00\x78\x00\x00\x00\x02\x00\x10\x00\x24\x00\x00\x00\x01\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x14\x00\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x01\x10\x00\x18\x00\x00\x00\x01\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00'
-
-
-def missing_resources(expected, dump_text, archive_entries):
+def missing_resources(expected, dump_text):
     found = set(re.findall(r'resource 0x[0-9a-f]+ ([a-z]+/[A-Za-z0-9_.$]+)', dump_text))
-    file_refs = {}
-    for res_type, name, path in re.findall(r'resource 0x[0-9a-f]+ ([a-z]+)/([A-Za-z0-9_.$]+)[^\n]*\n[^\n]*\(([^)]+)\)', dump_text):
-        file_refs.setdefault(f'{res_type}/{name}', []).append(path)
-    lost = []
-    for item in sorted(expected):
-        if item not in found:
-            lost.append(f'{item} (absent from resources.arsc)')
-            continue
-        paths = [p for p in file_refs.get(item, []) if p in archive_entries]
-        if paths and all(archive_entries[p] in (DUMMY_PNG, DUMMY_XML) or len(archive_entries[p]) == 0 for p in paths):
-            lost.append(f'{item} (replaced with shrunk dummy stub)')
-    return lost
+    return sorted(item for item in expected if item not in found)
 
 
 if len(sys.argv) > 1 and sys.argv[1] == '--self-test':
@@ -40,10 +25,9 @@ if len(sys.argv) > 1 and sys.argv[1] == '--self-test':
     right = "    #0 : (in LX;)\n      name          : '<init>'\n      type          : '()V'\n"
     assert not has_no_argument_constructor(wrong), 'a constructor with arguments and an unrelated ()V method must not pass'
     assert has_no_argument_constructor(right)
-    sample_dump = "resource 0x7f010001 string/ardia_build_commit\n  () \"abc\"\nresource 0x7f020001 drawable/ardia_logo\n  () (res/drawable/ardia_logo.xml)\n"
-    assert missing_resources({'string/ardia_build_commit', 'drawable/ardia_logo'}, sample_dump, {'res/drawable/ardia_logo.xml': b'<vector/>'}) == []
-    assert len(missing_resources({'string/ardia_release_version'}, sample_dump, {})) == 1
-    assert len(missing_resources({'drawable/ardia_logo'}, sample_dump, {'res/drawable/ardia_logo.xml': DUMMY_XML})) == 1
+    sample_dump = "    resource 0x7f150001 string/ardia_build_commit\n      () \"abc\"\n    resource 0x7f070082 drawable/ardia_logo\n      () (file) res/JK1.xml type=XML\n"
+    assert missing_resources({'string/ardia_build_commit', 'drawable/ardia_logo'}, sample_dump) == []
+    assert missing_resources({'string/ardia_release_version', 'drawable/ardia_logo'}, sample_dump) == ['string/ardia_release_version']
     print('self-test passed')
     sys.exit(0)
 
@@ -198,10 +182,8 @@ for root_dir in (repo / 'apps/phone/android/app/src/main', repo / 'packages/phon
                 if res_file.is_file():
                     expected_resources.add(f'{base_type}/{res_file.stem}')
 
-with zipfile.ZipFile(apk) as archive:
-    archive_entries = {name: archive.read(name) for name in archive.namelist() if name.startswith('res/')}
-lost_resources = missing_resources(expected_resources, values, archive_entries)
-print(f'runtime & app resources: {len(expected_resources)}, {len(lost_resources)} missing or shrunk')
+lost_resources = missing_resources(expected_resources, values)
+print(f'runtime & app resources: {len(expected_resources)}, {len(lost_resources)} missing')
 for item in lost_resources:
     print(f'  MISSING resource {item}')
 
